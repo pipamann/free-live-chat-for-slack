@@ -1,0 +1,72 @@
+{
+  "name": "free-live-chat-for-slack",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-22",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true
+  },
+
+  // Durable Objects for WebSocket session management
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT_SESSION",
+        "class_name": "ChatSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ChatSession"]
+    }
+  ],
+
+  // D1 Database for session metadata
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "live-chat-db",
+      "database_id": "YOUR_D1_DATABASE_ID"
+    }
+  ],
+
+  // R2 bucket for file uploads
+  "r2_buckets": [
+    {
+      "binding": "FILES_BUCKET",
+      "bucket_name": "live-chat-files"
+    }
+  ],
+
+  // Workers AI binding
+  "ai": {
+    "binding": "AI"
+  },
+
+  // Vectorize index for support knowledge base (optional - for AI chatbot)
+  "vectorize": [
+    {
+      "binding": "SUPPORT_INDEX",
+      "index_name": "support-knowledge-base"
+    }
+  ],
+
+  // Public environment variables
+  "vars": {
+    "SLACK_CHANNEL_ID": "YOUR_SLACK_CHANNEL_ID",
+    "ALLOWED_ORIGINS": "https://your-website.com,http://localhost:3000,http://localhost:4321"
+  },
+
+  // Secret environment variables (set via wrangler secret put)
+  // SLACK_BOT_TOKEN - Slack bot token (xoxb-...)
+  // SLACK_SIGNING_SECRET - Slack signing secret for webhook verification
+  // N8N_WEBHOOK_URL - (optional) n8n or other webhook URL for ticket creation
+  // TURNSTILE_SECRET_KEY - Cloudflare Turnstile secret for spam protection
+
+  "dev": {
+    "port": 8787
+  }
+}
