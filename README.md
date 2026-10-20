@@ -1,237 +1,199 @@
 # Free Live Chat for Slack
 
-A **completely free** live chat system that connects your website visitors to your Slack workspace. Built entirely on Cloudflare's free tier - no monthly fees, no per-seat pricing, no limits.
+A live chat for your website that you answer from Slack. Every conversation becomes a thread in a Slack channel; your team replies in the thread and the visitor sees the answer instantly. It runs on Cloudflare's free plan: no monthly fee, no per-seat pricing.
 
 ```
-Website Visitor              Cloudflare Edge              Your Slack
-      │                            │                           │
-      │──── WebSocket ────────────►│ Durable Object            │
-      │                            │ (sub-50ms latency)        │
-      │                            │      │                    │
-      │                            │      │─── Slack API ─────►│
-      │                            │      │    (new thread)    │
-      │                            │      │                    │
-      │◄─── WebSocket ─────────────│◄─────│◄── Events API ─────│
-      │     (staff reply)          │      │    (webhook)       │
+Website visitor                 Cloudflare                          Your Slack
+      │                              │                                   │
+      │── widget.js, WebSocket ─────►│ Worker ──► Durable Object         │
+      │                              │            (one per chat)         │
+      │                              │                 │── new thread ──►│
+      │                              │                 │                 │
+      │◄──────── staff reply ────────│◄── Events API ──│◄── thread reply │
 ```
-
-## Why This Exists
-
-Most live chat tools charge $15-50/seat/month. If you already use Slack, why pay again?
-
-This project gives you:
-- **$0/month** - Runs on Cloudflare's free tier
-- **Real-time** - WebSocket-based, not polling
-- **Global edge** - Sub-50ms latency worldwide via Durable Objects
-- **AI assistant** (optional) - RAG-powered bot using free Workers AI
-- **File sharing** - Customers can send files, stored in R2
-- **Session resumption** - Customers can close the tab and come back
-- **Spam protection** - Cloudflare Turnstile integration
-
-## Tech Stack (All Free Tier)
-
-| Service | Purpose | Free Limit |
-|---------|---------|------------|
-| **Workers** | API & routing | 100k requests/day |
-| **Durable Objects** | WebSocket sessions | 1M requests/month |
-| **D1** | Session metadata | 5GB storage |
-| **R2** | File uploads | 10GB storage |
-| **Workers AI** | AI chatbot | 10k neurons/day |
-| **Vectorize** | Knowledge base | 5M vectors |
-| **Turnstile** | Spam protection | Unlimited |
 
 ## Features
 
-### Core Chat
-- WebSocket-based real-time messaging
-- Bidirectional sync with Slack threads
-- Staff member identification (shows who replied)
-- 24-hour session resumption
-- Visitor metadata (browser, OS, location)
+- **Real-time chat** over WebSockets. Idle chats hibernate, so they cost nothing while nobody types.
+- **One Slack thread per chat** with the visitor's country, browser and page. Replies starting with `//` stay in Slack as notes for colleagues.
+- **Automatic replies while you're busy:** after 8 seconds "checking whether someone is available", after 30 seconds a contact form (email or phone). The details go to the thread and, optionally, to a webhook (n8n, Zapier, your helpdesk).
+- **Files both ways:** images, PDFs and text files up to 10 MB.
+- **One script tag** for the widget: no build step, no dependencies, works on any site, light and dark mode, full screen on phones.
+- **Spam protection:** Cloudflare Turnstile and a per-IP limit for new chats.
+- **Privacy by default:** no IP addresses stored, page URLs without query strings, everything deleted after 30 days (Slack keeps its own copy).
+- **Optional AI assistant** that answers from your FAQ until a human takes over. Off by default, see [docs/AI_CHATBOT.md](docs/AI_CHATBOT.md).
 
-### AI Chatbot (Optional)
-- RAG-powered responses from your knowledge base
-- Automatic handoff to humans for sensitive topics
-- Smart email collection when staff is unavailable
-- Confidence-based escalation
-- Disabled automatically when staff replies
+## What "free" means
 
-### File Handling
-- 10MB file uploads from customers
-- Secure presigned URLs
-- Files forwarded to Slack thread
-- Automatic cleanup
+Everything stays within Cloudflare's free allowances (as of October 2026):
 
-## Quick Start
+| Service | Used for | Free allowance |
+|---|---|---|
+| Workers | API, widget, Slack webhook | 100,000 requests/day, 10 ms CPU per request; static files like `widget.js` are free and unlimited |
+| Durable Objects | One object per chat: WebSockets, transcript | 100,000 requests/day (incoming WebSocket messages are billed at 20:1), 13,000 GB-s/day, 5 GB |
+| D1 | Maps Slack threads to chats | 5 million rows read and 100,000 written per day |
+| R2 | Files sent in the chat | 10 GB, 1 million writes and 10 million reads per month |
+| Turnstile | Spam protection | Unlimited |
+| Workers AI *(optional)* | AI assistant | 10,000 neurons/day, enough for a few hundred answers |
+| Vectorize *(optional)* | AI assistant's knowledge base | 5 million stored dimensions (about 4,800 FAQ entries), 30 million queried dimensions/month |
 
-### 1. Clone & Install
+In practice: a typical chat (a few page views, ten messages each way) uses about 30 Worker requests (Slack calls the webhook for every message in the thread, including the bot's own) and about 20 Durable Object requests, so the daily allowance covers roughly 3,000 chats. Cloudflare asks for a payment method before it enables R2, even if you stay within the free allowance.
+
+**Speed:** the Worker runs in the Cloudflare location nearest to the visitor. Each chat lives in a Durable Object that is created near the visitor who starts it and stays there. Durable Objects run in fewer locations than Workers (none in South America, Africa or the Middle East yet), so messages typically take tens of milliseconds, more on other continents. Staff replies arrive as fast as Slack delivers them, usually within a second.
+
+## Setup
+
+You need a Cloudflare account, a Slack workspace where you can install apps, a channel just for the chats (every message in it reaches the Worker), and Node.js 22 or newer.
+
+### 1. Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/free-live-chat-for-slack.git
+git clone https://github.com/pipamann/free-live-chat-for-slack.git
 cd free-live-chat-for-slack
 npm install
+npx wrangler login
 ```
 
-### 2. Create Cloudflare Resources
+### 2. Create the Cloudflare resources
 
 ```bash
-# Login to Cloudflare
-wrangler login
-
-# Create D1 database
-wrangler d1 create live-chat-db
-# Copy the database_id to wrangler.jsonc
-
-# Create R2 bucket
-wrangler r2 bucket create live-chat-files
-
-# (Optional) Create Vectorize index for AI
-npm run vectorize:create
-```
-
-### 3. Create Slack App
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → Create New App
-2. Add Bot Token Scopes:
-   - `chat:write` - Post messages
-   - `channels:history` - Read thread replies
-   - `users:read` - Get staff names
-   - `files:read` - Access shared files
-3. Install to workspace
-4. Copy the Bot Token (`xoxb-...`)
-5. Enable Events API → Set URL to `https://YOUR_WORKER.workers.dev/slack-webhook`
-6. Subscribe to `message.channels` event
-7. Copy the Signing Secret
-
-### 4. Configure
-
-Update `wrangler.jsonc`:
-```jsonc
-{
-  "vars": {
-    "SLACK_CHANNEL_ID": "C0123456789",  // Your support channel
-    "ALLOWED_ORIGINS": "https://your-website.com"
-  }
-}
-```
-
-Set secrets:
-```bash
-wrangler secret put SLACK_BOT_TOKEN        # xoxb-... from Slack
-wrangler secret put SLACK_SIGNING_SECRET   # From Slack App settings
-wrangler secret put TURNSTILE_SECRET_KEY   # From Cloudflare Turnstile
-```
-
-### 5. Deploy
-
-```bash
-# Run migrations
+npx wrangler d1 create live-chat-db         # copy the database_id into wrangler.jsonc
+npx wrangler r2 bucket create live-chat-files
 npm run db:migrate
-
-# Deploy worker
-npm run deploy
 ```
 
-### 6. Add Widget to Your Website
+Create a Turnstile widget in the Cloudflare dashboard (Turnstile → Add widget) for your website's domain. Note the site key and the secret key.
+
+### 3. Configure and deploy
+
+In `wrangler.jsonc`, set `ALLOWED_ORIGINS` to the exact origins of your website, for example `"https://example.com,https://www.example.com"`. Then:
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET_KEY
+npm run deploy                              # note the URL, e.g. https://free-live-chat-for-slack.you.workers.dev
+```
+
+### 4. Create the Slack app
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**, pick your workspace and paste [`slack-app-manifest.json`](slack-app-manifest.json). It requests these bot scopes: `chat:write`, `channels:history`, `groups:history` (private channels), `users:read` (staff names), `files:read` and `files:write`.
+2. **Install to Workspace**, then copy the **Bot User OAuth Token** (`xoxb-…`) and, under **Basic Information**, the **Signing Secret**:
+   ```bash
+   npx wrangler secret put SLACK_BOT_TOKEN
+   npx wrangler secret put SLACK_SIGNING_SECRET
+   ```
+3. Put the support channel's ID (channel details → bottom of the "About" tab, `C0…`) into `SLACK_CHANNEL_ID` in `wrangler.jsonc` and run `npm run deploy` again.
+4. **Event Subscriptions** → on → Request URL `https://YOUR_WORKER.workers.dev/slack-webhook` (Slack checks it immediately) → **Subscribe to bot events**: `message.channels`, plus `message.groups` for a private channel → Save. Reinstall the app if Slack asks.
+5. Invite the bot to the channel: `/invite @Live Chat`.
+
+### 5. Add the widget to your website
+
+```html
+<script src="https://YOUR_WORKER.workers.dev/widget.js" data-turnstile-site-key="0x…" defer></script>
+```
+
+Open your website, send a message and answer it in the Slack thread. If something does not arrive, `npm run tail` shows the Worker's logs.
+
+## Answering chats
+
+- Reply in the thread; the visitor sees your display name. Files you attach are forwarded (images, PDF, text).
+- Replies starting with `//` are not sent to the visitor.
+- As soon as someone replies, the automatic messages and the AI assistant stop.
+- If nobody answers within 30 seconds, the visitor gets a contact form. What they enter is posted to the thread and, if `TICKET_WEBHOOK_URL` is set, sent there as JSON: `email`, `phone`, `transcript`, `messages`, `visitor_info`, `country`, `session_id`, `slack_thread_ts`, `submitted_at`. With `TICKET_WEBHOOK_SECRET` the request carries `Authorization: Bearer <secret>`.
+- Visitors can resume a chat for 24 hours (reloads, other pages, coming back later).
+
+## Widget options
+
+Set them as `data-` attributes on the script tag or in `window.CHAT_CONFIG` before it:
+
+| Attribute | `CHAT_CONFIG` key | Default | |
+|---|---|---|---|
+| `data-turnstile-site-key` | `turnstileSiteKey` | none | Needed when the Worker has `TURNSTILE_SECRET_KEY` |
+| `data-color` | `color` | `#2563eb` | Accent color |
+| `data-position` | `position` | `right` | `left` or `right` |
+| `data-title`, `data-subtitle` | `texts.title`, `texts.subtitle` | "Chat with us" | Header text |
+| `data-service-url` | `serviceUrl` | where `widget.js` comes from | Only if you host the script yourself |
+
+All other labels can be changed through `texts`, for example to translate the widget:
 
 ```html
 <script>
   window.CHAT_CONFIG = {
-    serviceUrl: 'https://YOUR_WORKER.workers.dev',
-    turnstileSiteKey: 'YOUR_TURNSTILE_SITE_KEY'
+    turnstileSiteKey: '0x…',
+    texts: { title: 'Schreiben Sie uns', placeholder: 'Ihre Nachricht…', send: 'Senden' },
   };
 </script>
-<script src="https://YOUR_WORKER.workers.dev/widget.js"></script>
+<script src="https://YOUR_WORKER.workers.dev/widget.js" defer></script>
 ```
 
-## API Endpoints
+The keys are listed at the top of [`public/widget.js`](public/widget.js). Messages written by the server (automatic replies, errors) are in [`src/texts.ts`](src/texts.ts).
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/start` | POST | Create new chat session |
-| `/connect/:sessionId` | WebSocket | Real-time messaging |
-| `/slack-webhook` | POST | Slack Events API handler |
-| `/upload/:sessionId` | POST | Get presigned upload URL |
-| `/health` | GET | Health check |
+Open the chat from your own link or button with `window.FreeLiveChat.open()`.
+
+If your site has a Content Security Policy, allow your Worker in `script-src`, `connect-src` (https and wss) and `img-src`, and `https://challenges.cloudflare.com` in `script-src` and `frame-src` for Turnstile.
 
 ## Configuration
 
-### Environment Variables
+| Name | Where | |
+|---|---|---|
+| `SLACK_CHANNEL_ID` | `wrangler.jsonc` | Support channel ID |
+| `ALLOWED_ORIGINS` | `wrangler.jsonc` | Exact origins that may embed the chat, comma-separated |
+| `SLACK_BOT_TOKEN` | secret | Bot token (`xoxb-…`) |
+| `SLACK_SIGNING_SECRET` | secret | Required: without it every Slack event is rejected |
+| `TURNSTILE_SECRET_KEY` | secret | Strongly recommended: without it anyone can open chats from a script |
+| `TICKET_WEBHOOK_URL` | secret | Optional, receives the contact details (the old name `N8N_WEBHOOK_URL` still works) |
+| `TICKET_WEBHOOK_SECRET` | secret | Optional, sent as a Bearer token to the webhook |
 
-**Secrets** (via `wrangler secret put`):
-| Name | Required | Description |
-|------|----------|-------------|
-| `SLACK_BOT_TOKEN` | Yes | Slack bot token (`xoxb-...`) |
-| `SLACK_SIGNING_SECRET` | Yes | Slack webhook verification |
-| `TURNSTILE_SECRET_KEY` | Yes | Spam protection |
-| `N8N_WEBHOOK_URL` | No | Ticket creation webhook |
+Timings, limits and retention are constants in [`src/config.ts`](src/config.ts). The per-IP limit for new chats (5 per minute) is the `ratelimits` block in `wrangler.jsonc`; if your account rejects it, delete the block and rely on Turnstile.
 
-**Public** (in `wrangler.jsonc`):
-| Name | Description |
-|------|-------------|
-| `SLACK_CHANNEL_ID` | Slack channel for chat messages |
-| `ALLOWED_ORIGINS` | CORS allowed origins (comma-separated) |
+## Security and privacy
 
-### AI Chatbot Configuration
+- New chats need a valid Turnstile token and are rate limited per IP. Only `/start` creates chats; a chat's random ID works like a password for its WebSocket, files and resumption.
+- Slack events are accepted only with a valid signature that is at most five minutes old.
+- Visitor text is escaped before it goes to Slack, so it cannot ping `@channel` or disguise links. The widget renders all messages as plain text with clickable `http(s)` links only.
+- Uploads: allowed types only, file content must match the type, the extension is corrected, 10 MB and 10 files per chat. Downloads are served as attachments in a sandbox.
+- Stored data: the transcript and contact details in the chat's Durable Object, the Slack thread link (and email, if given) in D1, files in R2. All of it is deleted 30 days after the chat started, or after 24 hours if the visitor never wrote anything. IP addresses are not stored. Slack keeps whatever was posted there under your workspace's retention settings.
 
-Edit `src/prompts.ts` to customize:
-- Bot personality and tone
-- Handoff keywords (triggers human escalation)
-- Response templates
-- Your product/service name
+## AI assistant (optional)
 
-## Architecture
-
-```
-src/
-├── index.ts          # Worker entry, routing
-├── ChatSession.ts    # Durable Object (WebSocket handling)
-├── bot.ts            # AI chatbot with RAG
-├── prompts.ts        # Configurable bot personality
-├── slack.ts          # Slack API integration
-├── files.ts          # R2 file handling
-└── types.ts          # TypeScript types
-
-scripts/
-├── prepare-embeddings.ts  # Build knowledge base
-└── test-models.ts         # Compare AI models
-```
+The assistant answers from your own question-and-answer list (RAG with Vectorize and Workers AI), hands sensitive topics like billing straight to a human and goes quiet once your team replies. Setup and tuning: [docs/AI_CHATBOT.md](docs/AI_CHATBOT.md).
 
 ## Development
 
 ```bash
-# Local development
-npm run dev
-
-# For Slack webhooks locally, use ngrok
-ngrok http 8787
-# Update Slack Events API URL to ngrok URL
+cp .dev.vars.example .dev.vars   # local settings with Turnstile test keys
+npm run db:migrate:local
+npm run dev                      # test page: http://localhost:8787/demo
+npm run check                    # types, tests (in the Workers runtime) and a build
 ```
 
-## Customization
+Slack can only reach your machine through a tunnel, e.g. `cloudflared tunnel --url http://localhost:8787`; use that URL for the Event Subscriptions while testing.
 
-### Adding Knowledge Base Content
+```
+src/
+├── index.ts        Worker: routes, uploads, downloads, Slack webhook
+├── ChatSession.ts  Durable Object: one chat, WebSockets, Slack thread, automatic replies, cleanup
+├── slack.ts        Slack API, signature check, text conversion
+├── files.ts        File type, content and name checks
+├── http.ts         Origins, CORS, input limits, Turnstile
+├── bot.ts          AI assistant
+├── knowledge.ts    Knowledge base format (shared with scripts/)
+├── prompts.ts      The assistant's prompt and handoff topics
+├── texts.ts        Messages shown to visitors and posted to Slack
+├── config.ts       Timings, limits, models
+└── types.ts
+public/widget.js    The embeddable widget
+scripts/            Knowledge base upload and model comparison
+test/               Vitest tests
+```
 
-1. Create JSON files with Q&A pairs in `data/knowledge/`
-2. Run `npm run embeddings:prepare` to upload to Vectorize
-3. The AI will use this context for responses
+## Upgrading from 1.0
 
-### Styling the Widget
-
-The chat widget is customizable via CSS variables. See `widget/` directory for the frontend code.
-
-### Multi-language Support
-
-Edit `src/prompts.ts` to change the bot language. The system supports any language - just update the prompts and handoff keywords.
+- Run `npm run db:migrate`. It removes the old upload table and the IP addresses 1.0 stored.
+- `SLACK_SIGNING_SECRET` is now required, and `ALLOWED_ORIGINS` must list every origin exactly (origins containing "localhost" are no longer let through automatically).
+- Add the `files:write` scope (without it, visitor files never reached Slack) and `groups:history` for private channels, then reinstall the Slack app.
+- The AI assistant is off until you uncomment the `ai` and `vectorize` blocks in `wrangler.jsonc`, and its knowledge base must be uploaded again (new embedding model).
+- Download links of files sent before the upgrade stop working.
 
 ## License
 
-MIT - Use it however you want.
-
-## Contributing
-
-PRs welcome! This project is intentionally simple - please keep it that way.
-
----
-
-**Built with Cloudflare Workers, Durable Objects, D1, R2, Workers AI, and Vectorize.**
+MIT
