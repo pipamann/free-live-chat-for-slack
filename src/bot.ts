@@ -50,11 +50,12 @@ function containsWordStart(text: string, keyword: string): boolean {
 
 /** Visitor messages the bot has not answered yet (they are answered together). */
 export function unansweredVisitorText(messages: ChatMessage[]): string {
-  const lastBotIndex = messages.findLastIndex((m) => m.role !== 'customer');
+  // Automatic notices ("email noted") are not answers
+  const lastBotIndex = messages.findLastIndex((m) => m.role !== 'customer' && !m.auto);
   return messages
     .slice(lastBotIndex + 1)
+    .filter((m) => m.role === 'customer' && m.content)
     .map((m) => m.content)
-    .filter(Boolean)
     .join('\n');
 }
 
@@ -64,7 +65,7 @@ export function unansweredVisitorText(messages: ChatMessage[]): string {
  */
 export function buildModelMessages(systemPrompt: string, history: ChatMessage[]): ModelMessage[] {
   const turns: ModelMessage[] = [];
-  for (const message of history.filter((m) => m.content).slice(-BOT_MAX_HISTORY_MESSAGES)) {
+  for (const message of history.filter((m) => m.content && !m.auto).slice(-BOT_MAX_HISTORY_MESSAGES)) {
     const role = message.role === 'customer' ? 'user' : 'assistant';
     const previous = turns[turns.length - 1];
     if (previous?.role === role) previous.content += `\n${message.content}`;
@@ -86,15 +87,34 @@ export function cleanReply(text: string): string {
   return reply;
 }
 
+/** Same link pattern the widget uses to make links clickable. */
+const LINK = /https?:\/\/[^\s<>"']+/g;
+
+/** A link reduced to what decides where it leads; null for links that hide their target. */
+function normalizeLink(raw: string): string | null {
+  try {
+    const url = new URL(raw.replace(/[.,;:!?)\]]+$/, ''));
+    if (url.username || url.password) return null; // https://trusted.example@evil.example
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * True if the reply contains a link, email address or phone number that is neither in the
- * knowledge base entries nor in CONTACT_INFO. Models like to invent plausible ones.
+ * knowledge base entries nor in CONTACT_INFO. Models like to invent plausible ones. Links must
+ * match a known link exactly (up to a trailing slash), not just start like one.
  */
 export function hasUnverifiedDetails(reply: string, sources: string): boolean {
   const known = sources.toLowerCase();
   const knownDigits = sources.replace(/\D/g, '');
-  const links = reply.match(/https?:\/\/[^\s<>"'()]+/g) ?? [];
-  if (links.some((link) => !known.includes(link.replace(/[.,;:!?]+$/, '').toLowerCase()))) return true;
+  const knownLinks = new Set((sources.match(LINK) ?? []).map(normalizeLink));
+  const links = reply.match(LINK) ?? [];
+  if (links.some((link) => {
+    const normalized = normalizeLink(link);
+    return !normalized || !knownLinks.has(normalized);
+  })) return true;
   const emails = reply.match(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g) ?? [];
   if (emails.some((email) => !known.includes(email.toLowerCase()))) return true;
   const phones = reply.match(/\+?\d[\d ()./-]{5,}\d/g) ?? [];

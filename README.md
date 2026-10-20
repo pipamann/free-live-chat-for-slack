@@ -190,7 +190,7 @@ test/               Vitest tests
 
 - Run `npm run db:migrate`. It removes the old upload table, the IP addresses 1.0 stored and Slack thread links older than 30 days.
 - `SLACK_SIGNING_SECRET` and `TURNSTILE_SECRET_KEY` are now required (or set `DISABLE_TURNSTILE` to `"true"`), and `ALLOWED_ORIGINS` must list every origin exactly (origins containing "localhost" are no longer let through automatically).
-- If you wrote your own widget: `/upload/complete` now takes the file itself as the request body, with `sessionId` and `fileId` in the query string, and the response of `/upload/start` no longer contains `r2Key`.
+- If you wrote your own widget: `/upload/complete` now takes the file itself as the request body, with `sessionId` and `fileId` in the query string, and the response of `/upload/start` no longer contains `r2Key`. To resume a chat without opening a new one when it has expired, send `resumeOnly: true` to `/start` (answer: 404).
 - Add the `files:write` scope (without it, visitor files never reached Slack) and `groups:history` for private channels, then reinstall the Slack app.
 - The AI assistant is off until you uncomment the `ai` and `vectorize` blocks in `wrangler.jsonc`, and its knowledge base must be uploaded again (new embedding model).
 - Download links of files sent before the upgrade stop working.

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env, exports } from 'cloudflare:workers';
 import { createExecutionContext, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import worker from '../src/index';
-import { SESSION_RESUME_TTL_MS, SESSION_RETENTION_MS } from '../src/config';
+import { SESSION_RESUME_TTL_MS, SESSION_RETENTION_MS, STAGE_1_DELAY_MS } from '../src/config';
 import type { ChatState, ServerMessage } from '../src/types';
 import { ORIGIN, mockOutboundFetch, signSlackBody, slackCalls, waitFor } from './helpers';
 
@@ -115,6 +115,22 @@ describe('POST /start', () => {
     expect((await start({ sessionId: crypto.randomUUID() })).status).toBe(400);
   });
 
+  it('answers resume-only requests for unknown chats with 404 and never opens a chat for them', async () => {
+    mockOutboundFetch();
+    const response = await start({ sessionId: crypto.randomUUID(), resumeOnly: true, turnstile_token: 'valid-token' });
+    expect(response.status).toBe(404);
+  });
+
+  it('does not count failed resumes or requests without a token against the rate limit', async () => {
+    mockOutboundFetch();
+    const ip = '198.51.100.99';
+    for (let i = 0; i < 4; i++) {
+      expect((await start({ sessionId: crypto.randomUUID(), resumeOnly: true }, ORIGIN, ip)).status).toBe(404);
+      expect((await start({}, ORIGIN, ip)).status).toBe(400);
+    }
+    expect((await start({ turnstile_token: 'valid-token' }, ORIGIN, ip)).status).toBe(200);
+  });
+
   it('resumes an existing chat without a new token', async () => {
     mockOutboundFetch();
     const sessionId = await newChat();
@@ -170,6 +186,52 @@ describe('chat flow', () => {
       .bind(parent.ts)
       .first<{ session_name: string; ip_address: string | null }>();
     expect(row).toMatchObject({ session_name: sessionId, ip_address: null });
+
+    // After a reconnect the widget recognizes its own messages by their client ID
+    const again = await connect(sessionId);
+    await waitFor(() => again.received.some((m) => m.type === 'status'));
+    const status = again.received.find((m) => m.type === 'status')!;
+    expect(status.type === 'status' && status.payload.messages?.[0].clientId).toBe('local-1');
+  });
+
+  it('keeps posting to Slack when Slack refuses a file', async () => {
+    const calls = mockOutboundFetch({ fileUploadFails: true });
+    const sessionId = await newChat();
+    const { ws } = await connect(sessionId);
+    expect((await upload(sessionId, PNG, 'photo.png', 'image/png')).status).toBe(200);
+    await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 2);
+    ws.send(JSON.stringify({ type: 'message', content: 'Did you get my screenshot?' }));
+    await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 3);
+
+    const [parent, notice, text] = slackCalls(calls, 'chat.postMessage');
+    expect(parent.body.text).toContain('[File: photo.png]');
+    expect(notice.body.text).toContain('could not be uploaded');
+    expect(text.body.text).toBe('> Did you get my screenshot?');
+  });
+
+  it('falls back to the automatic replies when the bot is switched off during a chat', async () => {
+    mockOutboundFetch();
+    const sessionId = await newChat();
+    const { ws } = await connect(sessionId);
+    ws.send(JSON.stringify({ type: 'message', content: 'Hello' }));
+    let first = 0;
+    await waitFor(async () => {
+      first = await runInDurableObject(stub(sessionId), (i) => (i as unknown as { chat: ChatState }).chat.firstCustomerMessageAt ?? 0);
+      return first > 0;
+    });
+    // Pretend the chat started while the bot was on: no waiting messages scheduled
+    await editChat(sessionId, (chat) => {
+      chat.botActive = true;
+    });
+    await runInDurableObject(stub(sessionId), (_, state) => state.storage.setAlarm(Date.now() + SESSION_RETENTION_MS));
+
+    await evictDurableObject(stub(sessionId));
+    const [botActive, alarm] = await runInDurableObject(stub(sessionId), async (instance, state) => [
+      (instance as unknown as { chat: ChatState }).chat.botActive,
+      await state.storage.getAlarm(),
+    ]);
+    expect(botActive).toBe(false);
+    expect(alarm).toBe(first + STAGE_1_DELAY_MS);
   });
 
   it('retries the Slack thread on the next message when Slack was down', async () => {
@@ -253,6 +315,8 @@ describe('chat flow', () => {
       staffName: 'Alex',
     });
     expect(received).toContainEqual({ type: 'status', payload: { status: 'answered' } });
+    const answeredAt = received.findIndex((m) => m.type === 'status' && m.payload.status === 'answered');
+    expect(answeredAt).toBeLessThan(received.findIndex((m) => m.type === 'message' && m.payload.role === 'staff'));
 
     const alarm = await runInDurableObject(stub(sessionId), (_, state) => state.storage.getAlarm());
     const createdAt = await runInDurableObject(stub(sessionId), (instance) => (instance as unknown as { chat: ChatState }).chat.createdAt);
@@ -370,7 +434,7 @@ describe('retention', () => {
   it('deletes the transcript, files and Slack routing row after the retention period', async () => {
     const calls = mockOutboundFetch();
     const sessionId = await newChat();
-    const { ws } = await connect(sessionId);
+    const { ws, received } = await connect(sessionId);
     ws.send(JSON.stringify({ type: 'message', content: 'Hello' }));
     await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 1);
     expect((await upload(sessionId, PNG, 'a.png', 'image/png')).status).toBe(200);
@@ -393,5 +457,18 @@ describe('retention', () => {
     expect(row).toBeNull();
     const stored = await runInDurableObject(stub(sessionId), (_, state) => state.storage.list());
     expect(stored.size).toBe(0);
+    expect(received).toContainEqual({ type: 'status', payload: { status: 'ended', message: 'This chat has expired.' } });
+  });
+
+  it('deletes a file that finished uploading after its chat was deleted', async () => {
+    const sessionId = crypto.randomUUID();
+    const fileId = crypto.randomUUID();
+    const key = `${sessionId}/${fileId}`;
+    await env.FILES_BUCKET.put(key, PNG);
+    await stub(sessionId).addVisitorFile(
+      { id: fileId, name: 'late.png', mimeType: 'image/png', size: PNG.byteLength, url: `/file/${key}` },
+      key
+    );
+    expect(await env.FILES_BUCKET.head(key)).toBeNull();
   });
 });

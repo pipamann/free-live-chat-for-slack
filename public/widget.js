@@ -34,6 +34,7 @@
     contactSubmit: 'Send details',
     contactInvalid: 'Please enter a valid email address or phone number.',
     ended: 'This chat has ended.',
+    expired: 'This chat has expired.',
     newChat: 'Start a new chat',
     retry: 'Try again',
     connecting: 'Connecting…',
@@ -291,7 +292,18 @@
       const trailing = /[.,;:!?)\]]+$/.exec(url);
       if (trailing) url = url.slice(0, -trailing[0].length);
       fragment.append(text.slice(last, match.index));
-      fragment.append(el('a', { href: url, target: '_blank', rel: 'noopener noreferrer nofollow', text: url }));
+      let parsed = null;
+      try {
+        parsed = new URL(url);
+      } catch {
+        // not a valid URL: stays text
+      }
+      // https://trusted.example@evil.example leads to evil.example, so it stays text
+      if (parsed && !parsed.username && !parsed.password) {
+        fragment.append(el('a', { href: parsed.href, target: '_blank', rel: 'noopener noreferrer nofollow', text: url }));
+      } else {
+        fragment.append(url);
+      }
       last = match.index + url.length;
     }
     fragment.append(text.slice(last));
@@ -509,21 +521,29 @@
     });
   }
 
-  async function startSession() {
+  /**
+   * Resumes the stored chat, or opens a new one. After a lost connection (allowNew false) an
+   * expired chat is shown as ended instead of being replaced silently.
+   */
+  async function startSession(allowNew = true) {
     if (state.starting) return;
     state.starting = true;
     state.status = 'connecting';
     setNotice(texts.connecting);
     try {
-      const stored = storage.get('localStorage', SESSION_KEY);
+      const stored = storage.get('localStorage', SESSION_KEY) || state.sessionId;
       let result = null;
       if (stored) {
-        result = await post('/start', { sessionId: stored, visitor: visitorInfo() });
-        // Expired or ended chats are replaced by a new one, which needs a fresh Turnstile token
-        if (!result.ok && result.status === 400 && /turnstile/i.test(result.data.error || '')) result = null;
+        result = await post('/start', { sessionId: stored, resumeOnly: true, visitor: visitorInfo() });
+        if (result.status === 404) result = null;
       }
       if (!result) {
         storage.set('localStorage', SESSION_KEY, null);
+        if (!allowNew) {
+          setStatus('ended', texts.expired);
+          setNotice('');
+          return;
+        }
         const token = config.turnstileSiteKey ? await turnstileToken() : undefined;
         result = await post('/start', { visitor: visitorInfo(), turnstile_token: token });
       }
@@ -588,8 +608,8 @@
     const attempt = state.reconnectAttempts++;
     state.notice = texts.reconnecting;
     const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
-    // After a few failures the chat may have expired: ask the server again (it resumes or starts a new one)
-    state.timers.reconnect = setTimeout(() => (attempt >= 2 ? startSession() : connect()), delay);
+    // After a few failures the chat may have expired: ask the server whether it still exists
+    state.timers.reconnect = setTimeout(() => (attempt >= 2 ? startSession(false) : connect()), delay);
   }
 
   function send(payload) {
@@ -610,7 +630,7 @@
           const pending = state.messages.filter((m) => m.pending);
           state.messages = payload.messages.slice();
           for (const local of pending) {
-            const arrived = state.messages.some((m) => m.role === 'customer' && m.content === local.content);
+            const arrived = state.messages.some((m) => m.clientId === local.clientId);
             if (!arrived && send({ type: 'message', content: local.content, clientId: local.clientId })) state.messages.push(local);
           }
         }

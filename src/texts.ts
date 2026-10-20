@@ -11,6 +11,7 @@ export const VISITOR_TEXTS = {
   emailNoted: "Thanks, I've noted your email address. A team member will follow up with you.",
   invalidContact: 'Please enter a valid email address or phone number.',
   alreadyEnded: 'This chat has ended. Please start a new one.',
+  expired: 'This chat has expired.',
   tooManyMessages: 'You are sending messages too quickly. Please wait a moment.',
   sessionFull: 'This chat has reached its maximum length. Please start a new one.',
   invalidMessage: 'Invalid message format.',
@@ -29,6 +30,8 @@ export const SLACK_TEXTS = {
   unknown: 'Unknown',
   fileUploaded: (name: string) => `📎 Visitor sent a file: ${name}`,
   fileMessage: (name: string) => `📎 [File: ${name}]`,
+  fileUploadFailed: (name: string) =>
+    `⚠️ The visitor sent ${name}, but it could not be uploaded here. Does the app have the files:write scope?`,
   emailCaptured: (email: string) => `📧 Email captured: ${email}`,
   contactLeft: '📇 Visitor left contact details:',
   email: 'Email',

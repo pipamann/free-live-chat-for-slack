@@ -222,6 +222,16 @@ describe('bot helpers', () => {
     expect(unansweredVisitorText(history)).toBe('one\ntwo');
   });
 
+  it('does not treat automatic notices as answers', () => {
+    const notice = { ...message('bot', "Thanks, I've noted your email address."), auto: true };
+    const history = [message('customer', 'How long is shipping?'), notice, message('customer', 'me@example.com')];
+    expect(unansweredVisitorText(history)).toBe('How long is shipping?\nme@example.com');
+    expect(buildModelMessages('SYSTEM', history)).toEqual([
+      { role: 'system', content: 'SYSTEM' },
+      { role: 'user', content: 'How long is shipping?\nme@example.com' },
+    ]);
+  });
+
   it('keeps visitor text in user turns and starts with the user', () => {
     const history = [message('bot', 'auto reply'), message('customer', 'a'), message('customer', 'b'), message('bot', 'c')];
     expect(buildModelMessages('SYSTEM', history)).toEqual([
@@ -239,6 +249,14 @@ describe('bot helpers', () => {
     expect(hasUnverifiedDetails('Log in at https://examp1e.com/login', sources)).toBe(true);
     expect(hasUnverifiedDetails('Write to support@example.com', sources)).toBe(true);
     expect(hasUnverifiedDetails('Delivery takes 2 to 3 days.', sources)).toBe(false);
+  });
+
+  it('checks whole links, so a known link cannot hide another target', () => {
+    const sources = 'A: Details on https://example.com/help';
+    expect(hasUnverifiedDetails('See https://example.com/help/ for details.', sources)).toBe(false);
+    expect(hasUnverifiedDetails('Log in at https://example.com(login)@evil.example', sources)).toBe(true);
+    expect(hasUnverifiedDetails('See https://example.com/help@evil.example', sources)).toBe(true);
+    expect(hasUnverifiedDetails('See https://example.com/help?ref=x', sources)).toBe(true);
   });
 
   it('removes reasoning blocks and caps long replies', () => {

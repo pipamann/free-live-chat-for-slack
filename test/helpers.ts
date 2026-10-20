@@ -31,7 +31,7 @@ let lastTs = 0;
  * Replaces outbound fetch with fakes for Turnstile, Slack and the ticket webhook.
  * Turnstile accepts the token "valid-token". Returns the recorded calls.
  */
-export function mockOutboundFetch(options: { slackDown?: boolean } = {}) {
+export function mockOutboundFetch(options: { slackDown?: boolean; fileUploadFails?: boolean } = {}) {
   const calls: RecordedCall[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const request = new Request(input as RequestInfo, init as RequestInit);
@@ -55,6 +55,7 @@ export function mockOutboundFetch(options: { slackDown?: boolean } = {}) {
         case '/api/users.info':
           return Response.json({ ok: true, user: { real_name: 'Alex Example', profile: { display_name: 'Alex' } } });
         case '/api/files.getUploadURLExternal':
+          if (options.fileUploadFails) return Response.json({ ok: false, error: 'missing_scope' });
           return Response.json({ ok: true, upload_url: 'https://files.slack.com/upload/v1/abc', file_id: 'F123' });
         default:
           return Response.json({ ok: true });

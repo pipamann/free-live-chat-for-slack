@@ -90,8 +90,21 @@ async function handleStart(request: Request, env: Env, origin: string | null): P
   if (isUuid(body.sessionId) && (await sessionStub(env, body.sessionId).resume(visitorInfo))) {
     return json({ sessionId: body.sessionId, wsUrl: websocketUrl(request, body.sessionId), resumed: true }, 200, cors);
   }
+  // The widget asks this way after a reload or reconnect; a new chat is only opened on purpose
+  if (body.resumeOnly === true) {
+    return json({ error: 'Chat not found or expired' }, 404, cors);
+  }
 
-  // Everything below creates a new chat, so it is where spam protection applies
+  // Everything below creates a new chat, so it is where spam protection applies.
+  // Requests without a token are turned away before they count against the rate limit.
+  if (env.TURNSTILE_SECRET_KEY && !body.turnstile_token) {
+    return json({ error: 'Turnstile token required' }, 400, cors);
+  }
+  if (!env.TURNSTILE_SECRET_KEY && env.DISABLE_TURNSTILE !== 'true') {
+    // A forgotten secret must not silently switch the spam protection off
+    console.error('[start] TURNSTILE_SECRET_KEY is not set. Set it, or set DISABLE_TURNSTILE to "true".');
+    return json({ error: 'The chat is not configured yet' }, 503, cors);
+  }
   const ip = request.headers.get('CF-Connecting-IP');
   if (env.START_LIMITER && ip) {
     const { success } = await env.START_LIMITER.limit({ key: rateLimitKey(ip) });
@@ -99,17 +112,8 @@ async function handleStart(request: Request, env: Env, origin: string | null): P
       return json({ error: 'Too many new chats. Please try again in a minute.' }, 429, cors);
     }
   }
-  if (env.TURNSTILE_SECRET_KEY) {
-    if (!body.turnstile_token) {
-      return json({ error: 'Turnstile token required' }, 400, cors);
-    }
-    if (!(await verifyTurnstile(body.turnstile_token, ip, env.TURNSTILE_SECRET_KEY))) {
-      return json({ error: 'Turnstile verification failed' }, 403, cors);
-    }
-  } else if (env.DISABLE_TURNSTILE !== 'true') {
-    // A forgotten secret must not silently switch the spam protection off
-    console.error('[start] TURNSTILE_SECRET_KEY is not set. Set it, or set DISABLE_TURNSTILE to "true".');
-    return json({ error: 'The chat is not configured yet' }, 503, cors);
+  if (env.TURNSTILE_SECRET_KEY && !(await verifyTurnstile(body.turnstile_token, ip, env.TURNSTILE_SECRET_KEY))) {
+    return json({ error: 'Turnstile verification failed' }, 403, cors);
   }
 
   const sessionId = crypto.randomUUID();

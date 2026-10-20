@@ -61,6 +61,10 @@ export interface ChatMessage {
   attachments?: FileAttachment[];
   /** The bot handed the conversation over to a human. */
   isHandoff?: boolean;
+  /** An automatic notice ("checking availability", "email noted"), not an answer to the visitor. */
+  auto?: boolean;
+  /** The widget's own ID for a visitor message, so it can tell after a reconnect what arrived. */
+  clientId?: string;
 }
 
 export interface VisitorInfo {

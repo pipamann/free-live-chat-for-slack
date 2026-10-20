@@ -65,8 +65,12 @@ export class ChatSession extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       const stored = await ctx.storage.get<ChatState>(STATE_KEY);
       this.chat = stored ? withDefaults(stored) : null;
-      // The bot may have been switched off since this chat started
-      if (this.chat && !isBotEnabled(env)) this.chat.botActive = false;
+      // The bot was switched off since this chat started: fall back to the automatic replies
+      if (this.chat?.botActive && !isBotEnabled(env)) {
+        this.chat.botActive = false;
+        await this.save();
+        await this.scheduleAlarm();
+      }
     });
   }
 
@@ -145,7 +149,11 @@ export class ChatSession extends DurableObject<Env> {
   /** Shows a file the visitor uploaded (already stored in R2) and forwards it to Slack. */
   async addVisitorFile(attachment: FileAttachment, key: string): Promise<void> {
     const chat = this.chat;
-    if (!chat) return;
+    if (!chat) {
+      // The chat was deleted while the file was uploading; nothing else would ever delete it
+      await this.env.FILES_BUCKET.delete(key);
+      return;
+    }
     chat.files[attachment.id] = key;
     await this.addVisitorMessage(newMessage('customer', '', { attachments: [attachment] }));
   }
@@ -165,32 +173,29 @@ export class ChatSession extends DurableObject<Env> {
       return;
     }
 
-    const attachments = reply.files?.length ? await this.storeSlackFiles(reply.files) : [];
     let content = slackToPlainText(reply.text).trim().slice(0, 10_000);
-    if (!content && attachments.length === 0) {
-      if (!reply.files?.length) return;
-      content = VISITOR_TEXTS.fileFailed;
-    }
+    if (!content && !reply.files?.length) return;
 
-    // A human took over: no more bot replies or automatic messages
+    // A human took over: no more bot replies or automatic messages. Decided before the
+    // file downloads, so nothing automatic slips in while they run.
     this.cancelBot();
     chat.botActive = false;
     const statusChanged = chat.status === 'active' || chat.status === 'escalated';
     if (statusChanged) chat.status = 'answered';
+    await this.save();
+    await this.scheduleAlarm();
+    if (statusChanged) this.broadcast({ type: 'status', payload: { status: chat.status } });
 
+    const attachments = reply.files?.length ? await this.storeSlackFiles(reply.files) : [];
+    if (!content && attachments.length === 0) content = VISITOR_TEXTS.fileFailed;
     const message = newMessage('staff', content, {
       staffName: reply.staffName,
       attachments: attachments.length ? attachments : undefined,
     });
     chat.messages.push(message);
     await this.save();
-    await this.scheduleAlarm();
-
     this.broadcast({ type: 'message', payload: message });
-    if (statusChanged) {
-      this.broadcast({ type: 'status', payload: { status: chat.status } });
-      await this.updateRoutingRow({ status: chat.status });
-    }
+    if (statusChanged) await this.updateRoutingRow({ status: chat.status });
   }
 
   // ---------------------------------------------------------------------------
@@ -271,9 +276,10 @@ export class ChatSession extends DurableObject<Env> {
       return;
     }
 
+    // Decided before any network call: a staff reply arriving during one must not be overwritten.
+    // (Storage writes do not let other events in, Slack and D1 calls do.)
+    let escalated = false;
     if (this.waitingForStaff() && chat.firstCustomerMessageAt) {
-      // Also a retry for visitor messages that could not be posted to Slack
-      await this.enqueueSlack(() => this.syncVisitorMessages());
       if (!chat.stage1Sent && now >= chat.firstCustomerMessageAt + STAGE_1_DELAY_MS) {
         chat.stage1Sent = true;
         await this.addAutoReply(VISITOR_TEXTS.stage1);
@@ -283,11 +289,18 @@ export class ChatSession extends DurableObject<Env> {
         chat.status = 'escalated';
         await this.addAutoReply(VISITOR_TEXTS.stage2);
         this.broadcast({ type: 'status', payload: { status: 'escalated' } });
-        await this.updateRoutingRow({ status: 'escalated' });
-        await this.postNotice(SLACK_TEXTS.stageNotice(escapeSlackText(VISITOR_TEXTS.stage2)));
+        escalated = true;
       }
     }
     await this.scheduleAlarm();
+
+    // Network calls last; they also retry visitor messages that could not be posted earlier
+    if (escalated) {
+      await this.updateRoutingRow({ status: 'escalated' });
+      await this.postNotice(SLACK_TEXTS.stageNotice(escapeSlackText(VISITOR_TEXTS.stage2)));
+    } else if (chat.slackSyncedCount < chat.messages.filter((m) => m.role === 'customer').length) {
+      await this.enqueueSlack(() => this.syncVisitorMessages());
+    }
   }
 
   /** Runs whichever comes first: the next automatic reply or the deletion of the chat. */
@@ -308,7 +321,7 @@ export class ChatSession extends DurableObject<Env> {
   }
 
   private async addAutoReply(text: string): Promise<void> {
-    const message = newMessage('bot', text);
+    const message = newMessage('bot', text, { auto: true });
     this.chat!.messages.push(message);
     await this.save();
     this.broadcast({ type: 'message', payload: message });
@@ -327,6 +340,7 @@ export class ChatSession extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000);
       return;
     }
+    this.broadcast({ type: 'status', payload: { status: 'ended', message: VISITOR_TEXTS.expired } });
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.close(1000, 'Chat expired');
@@ -347,8 +361,8 @@ export class ChatSession extends DurableObject<Env> {
     const content = typeof data.content === 'string' ? data.content.trim().slice(0, MAX_MESSAGE_LENGTH) : '';
     if (!content || !this.allowVisitorAction(ws)) return;
 
-    const message = newMessage('customer', content);
     const clientId = typeof data.clientId === 'string' ? data.clientId.slice(0, 64) : undefined;
+    const message = newMessage('customer', content, { clientId });
     await this.addVisitorMessage(message, ws, clientId);
 
     const chat = this.chat!;
@@ -494,6 +508,8 @@ export class ChatSession extends DurableObject<Env> {
       this.botTimer = null;
       this.ctx.waitUntil(this.runBot());
     }, BOT_DEBOUNCE_MS);
+    // Keeps the object in memory until the timer has fired
+    this.ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, BOT_DEBOUNCE_MS + 1000)));
   }
 
   private cancelBot(): void {
@@ -588,7 +604,15 @@ export class ChatSession extends DurableObject<Env> {
         await postSlackMessage(this.env, text, { threadTs: chat.slackThreadTs });
       }
       for (const attachment of message.attachments ?? []) {
-        await this.uploadVisitorFileToSlack(attachment);
+        try {
+          await this.uploadVisitorFileToSlack(attachment);
+        } catch (error) {
+          // A file Slack refuses (e.g. without the files:write scope) must not hold up the rest of the chat
+          console.error('[ChatSession] Uploading a file to Slack failed:', error);
+          await postSlackMessage(this.env, escapeSlackText(SLACK_TEXTS.fileUploadFailed(attachment.name)), {
+            threadTs: chat.slackThreadTs,
+          });
+        }
       }
       chat.slackSyncedCount++;
       await this.save();
@@ -728,7 +752,7 @@ function send(ws: WebSocket, message: ServerMessage): void {
 function newMessage(
   role: ChatMessage['role'],
   content: string,
-  extra: Partial<Pick<ChatMessage, 'staffName' | 'attachments' | 'isHandoff'>> = {}
+  extra: Partial<Pick<ChatMessage, 'staffName' | 'attachments' | 'isHandoff' | 'auto' | 'clientId'>> = {}
 ): ChatMessage {
   return { id: crypto.randomUUID(), role, content, timestamp: Date.now(), ...extra };
 }
