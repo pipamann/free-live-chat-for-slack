@@ -1,14 +1,19 @@
 {
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "free-live-chat-for-slack",
   "main": "src/index.ts",
-  "compatibility_date": "2026-01-22",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2026-10-15",
 
   "observability": {
     "enabled": true
   },
 
-  // Durable Objects for WebSocket session management
+  // Serves public/widget.js, the script you embed on your website
+  "assets": {
+    "directory": "./public"
+  },
+
+  // One Durable Object per chat: WebSocket connections and the transcript
   "durable_objects": {
     "bindings": [
       {
@@ -24,7 +29,7 @@
     }
   ],
 
-  // D1 Database for session metadata
+  // Maps Slack threads to chats
   "d1_databases": [
     {
       "binding": "DB",
@@ -33,7 +38,7 @@
     }
   ],
 
-  // R2 bucket for file uploads
+  // Files sent in the chat
   "r2_buckets": [
     {
       "binding": "FILES_BUCKET",
@@ -41,30 +46,39 @@
     }
   ],
 
-  // Workers AI binding
-  "ai": {
-    "binding": "AI"
-  },
-
-  // Vectorize index for support knowledge base (optional - for AI chatbot)
-  "vectorize": [
+  // At most 5 new chats per minute from one IP address (counted per Cloudflare location)
+  "ratelimits": [
     {
-      "binding": "SUPPORT_INDEX",
-      "index_name": "support-knowledge-base"
+      "name": "START_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 5, "period": 60 }
     }
   ],
 
-  // Public environment variables
+  // Optional AI bot. Uncomment both blocks after following docs/AI_CHATBOT.md.
+  // "ai": {
+  //   "binding": "AI"
+  // },
+  // "vectorize": [
+  //   {
+  //     "binding": "SUPPORT_INDEX",
+  //     "index_name": "support-knowledge-base"
+  //   }
+  // ],
+
   "vars": {
+    // Channel ID (C0123456789), not the name
     "SLACK_CHANNEL_ID": "YOUR_SLACK_CHANNEL_ID",
-    "ALLOWED_ORIGINS": "https://your-website.com,http://localhost:3000,http://localhost:4321"
+    // Exact origins that may embed the chat, comma-separated. Add http://localhost:4321 etc. for local testing.
+    "ALLOWED_ORIGINS": "https://your-website.com"
   },
 
-  // Secret environment variables (set via wrangler secret put)
-  // SLACK_BOT_TOKEN - Slack bot token (xoxb-...)
-  // SLACK_SIGNING_SECRET - Slack signing secret for webhook verification
-  // N8N_WEBHOOK_URL - (optional) n8n or other webhook URL for ticket creation
-  // TURNSTILE_SECRET_KEY - Cloudflare Turnstile secret for spam protection
+  // Secrets, set with `npx wrangler secret put <NAME>` (locally: .dev.vars):
+  //   SLACK_BOT_TOKEN         Bot token (xoxb-…)
+  //   SLACK_SIGNING_SECRET    Verifies that webhook calls come from Slack
+  //   TURNSTILE_SECRET_KEY    Spam protection for new chats (strongly recommended)
+  //   TICKET_WEBHOOK_URL      Optional: receives the transcript when a visitor leaves contact details
+  //   TICKET_WEBHOOK_SECRET   Optional: sent to that webhook as "Authorization: Bearer <secret>"
 
   "dev": {
     "port": 8787

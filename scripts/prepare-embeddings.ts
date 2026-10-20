@@ -1,272 +1,119 @@
 #!/usr/bin/env npx tsx
 /**
- * Prepare embeddings for the Vectorize knowledge base
+ * Uploads your knowledge base to Vectorize so the AI bot can answer from it.
  *
- * This is an EXAMPLE script. Customize it to read your own data format.
+ * Put one or more JSON files into data/knowledge/, each an array of entries
+ * (see docs/knowledge-example.json):
+ *   [{ "id": "shipping-time", "category": "Shipping", "question": "…", "answer": "…" }]
  *
  * Usage:
- *   CLOUDFLARE_ACCOUNT_ID=xxx CLOUDFLARE_API_TOKEN=xxx npx tsx scripts/prepare-embeddings.ts
+ *   CLOUDFLARE_ACCOUNT_ID=… CLOUDFLARE_API_TOKEN=… npm run embeddings:prepare
  *
- * Prerequisites:
- *   - wrangler login (or CLOUDFLARE_API_TOKEN env var)
- *   - Vectorize index created: npm run vectorize:create
+ * The API token needs the "Workers AI: Read" and "Vectorize: Edit" permissions.
+ * Running it again is safe: an entry with the same id replaces the old one.
  */
 
-import { readFileSync, readdirSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from '../src/config.js';
+import type { KnowledgeEntry, KnowledgeMetadata } from '../src/knowledge.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const PROJECT_ROOT = join(__dirname, '..');
-
-// Cloudflare configuration
 const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
-const INDEX_NAME = 'support-knowledge-base';
+const INDEX_NAME = process.env.VECTORIZE_INDEX ?? 'support-knowledge-base';
+const KNOWLEDGE_DIR = join(import.meta.dirname, '..', 'data', 'knowledge');
+const BATCH_SIZE = 50;
+/** The Vectorize free plan stores 5 million dimensions, i.e. this many vectors. */
+const FREE_PLAN_MAX_VECTORS = Math.floor(5_000_000 / EMBEDDING_DIMENSIONS);
+/** bge-m3 reliably handles about 512 tokens; longer text is cut. */
+const MAX_EMBED_CHARS = 1500;
+/** Vectorize allows 10 KiB of metadata per vector. */
+const MAX_ANSWER_CHARS = 4000;
 
-// Embedding model dimensions (bge-large-en-v1.5 produces 1024-dim vectors)
-const EMBEDDING_DIMENSIONS = 1024;
-
-interface KnowledgeEntry {
-  id: string;
-  question: string;
-  answer: string;
-  category?: string;
-  keywords?: string[];
+async function cloudflare<T>(path: string, body: string, contentType: string): Promise<T> {
+  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${API_TOKEN}`, 'Content-Type': contentType },
+    body,
+  });
+  const result = (await response.json()) as { success: boolean; result: T; errors?: unknown };
+  if (!response.ok || !result.success) {
+    throw new Error(`${path}: HTTP ${response.status} ${JSON.stringify(result.errors)}`);
+  }
+  return result.result;
 }
 
-interface VectorMetadata {
-  type: 'faq' | 'product' | 'general';
-  category?: string;
-  question?: string;
-  answer?: string;
-  keywords?: string[];
-}
+function loadEntries(): KnowledgeEntry[] {
+  if (!existsSync(KNOWLEDGE_DIR)) {
+    console.error(`No ${KNOWLEDGE_DIR} folder. Create it and add JSON files (see docs/knowledge-example.json).`);
+    process.exit(1);
+  }
 
-interface VectorRecord {
-  id: string;
-  values: number[];
-  metadata: VectorMetadata;
-}
-
-/**
- * CUSTOMIZE THIS: Load your knowledge base data
- *
- * Example format (data/knowledge/*.json):
- * [
- *   {
- *     "id": "faq-1",
- *     "question": "How do I reset my password?",
- *     "answer": "Go to Settings > Security > Reset Password...",
- *     "category": "Account",
- *     "keywords": ["password", "reset", "login"]
- *   }
- * ]
- */
-function loadKnowledgeBase(): KnowledgeEntry[] {
-  const knowledgeDir = join(PROJECT_ROOT, 'data', 'knowledge');
   const entries: KnowledgeEntry[] = [];
-
-  if (!existsSync(knowledgeDir)) {
-    console.log(`Knowledge directory not found: ${knowledgeDir}`);
-    console.log('Create data/knowledge/*.json files with your Q&A content.');
-    console.log('\nExample format:');
-    console.log(
-      JSON.stringify(
-        [
-          {
-            id: 'faq-1',
-            question: 'How do I reset my password?',
-            answer: 'Go to Settings > Security > Reset Password...',
-            category: 'Account',
-            keywords: ['password', 'reset', 'login'],
-          },
-        ],
-        null,
-        2
-      )
-    );
-    return [];
-  }
-
-  try {
-    const files = readdirSync(knowledgeDir).filter((f) => f.endsWith('.json'));
-
-    for (const file of files) {
-      console.log(`Reading ${file}...`);
-      const content = readFileSync(join(knowledgeDir, file), 'utf-8');
-      const data: KnowledgeEntry[] = JSON.parse(content);
-      entries.push(...data);
+  const seen = new Set<string>();
+  for (const file of readdirSync(KNOWLEDGE_DIR).filter((name) => name.endsWith('.json'))) {
+    const data: unknown = JSON.parse(readFileSync(join(KNOWLEDGE_DIR, file), 'utf-8'));
+    if (!Array.isArray(data)) throw new Error(`${file}: expected an array of entries`);
+    for (const [index, entry] of data.entries()) {
+      const where = `${file}[${index}]`;
+      if (typeof entry?.id !== 'string' || !entry.id || new TextEncoder().encode(entry.id).length > 64) {
+        throw new Error(`${where}: "id" must be a string of at most 64 bytes`);
+      }
+      if (typeof entry.question !== 'string' || typeof entry.answer !== 'string' || !entry.question || !entry.answer) {
+        throw new Error(`${where}: "question" and "answer" are required`);
+      }
+      if (seen.has(entry.id)) throw new Error(`${where}: duplicate id "${entry.id}"`);
+      seen.add(entry.id);
+      entries.push(entry);
     }
-
-    console.log(`Loaded ${entries.length} knowledge entries`);
-    return entries;
-  } catch (error) {
-    console.error('Error loading knowledge base:', error);
-    return [];
+    console.log(`Read ${file}`);
   }
+  return entries;
 }
 
-/**
- * Generate embedding using Cloudflare Workers AI API
- */
-async function generateEmbedding(text: string): Promise<number[]> {
-  if (!ACCOUNT_ID || !API_TOKEN) {
-    throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set');
-  }
-
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/ai/run/@cf/baai/bge-large-en-v1.5`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${API_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text: [text],
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Embedding API error: ${response.status} - ${error}`);
-  }
-
-  const result = (await response.json()) as {
-    success: boolean;
-    result?: { data: number[][] };
-    errors?: unknown[];
-  };
-
-  if (!result.success || !result.result?.data?.[0]) {
-    throw new Error(`Embedding failed: ${JSON.stringify(result.errors)}`);
-  }
-
-  return result.result.data[0];
-}
-
-/**
- * Upload vectors to Vectorize
- */
-async function uploadVectors(vectors: VectorRecord[]): Promise<void> {
-  if (!ACCOUNT_ID || !API_TOKEN) {
-    throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must be set');
-  }
-
-  // Vectorize API expects NDJSON format
-  const ndjson = vectors.map((v) => JSON.stringify(v)).join('\n');
-
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/vectorize/v2/indexes/${INDEX_NAME}/upsert`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${API_TOKEN}`,
-        'Content-Type': 'application/x-ndjson',
-      },
-      body: ndjson,
-    }
-  );
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Vectorize API error: ${response.status} - ${error}`);
-  }
-
-  const result = (await response.json()) as { success: boolean; errors?: unknown[] };
-  if (!result.success) {
-    throw new Error(`Vectorize upsert failed: ${JSON.stringify(result.errors)}`);
-  }
-}
-
-/**
- * Main function
- */
 async function main() {
-  console.log('=== Knowledge Base Embedding Builder ===\n');
-
-  // Check environment
   if (!ACCOUNT_ID || !API_TOKEN) {
-    console.error('Error: Please set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN');
-    console.log('\nExample:');
-    console.log(
-      '  CLOUDFLARE_ACCOUNT_ID=xxx CLOUDFLARE_API_TOKEN=xxx npx tsx scripts/prepare-embeddings.ts'
-    );
+    console.error('Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN first.');
     process.exit(1);
   }
 
-  // Load data
-  const entries = loadKnowledgeBase();
-
+  const entries = loadEntries();
   if (entries.length === 0) {
-    console.error('\nNo knowledge base entries found.');
-    console.log('Create data/knowledge/*.json files with your Q&A content.');
+    console.error('No entries found.');
     process.exit(1);
   }
+  console.log(`${entries.length} entries, embedding with ${EMBEDDING_MODEL} into "${INDEX_NAME}"`);
+  if (entries.length > FREE_PLAN_MAX_VECTORS) {
+    console.warn(`Warning: the Vectorize free plan holds about ${FREE_PLAN_MAX_VECTORS} vectors of this size.`);
+  }
 
-  const vectors: VectorRecord[] = [];
-  let processed = 0;
+  for (let start = 0; start < entries.length; start += BATCH_SIZE) {
+    const batch = entries.slice(start, start + BATCH_SIZE);
+    const texts = batch.map((entry) => `${entry.question}\n${entry.answer}`.slice(0, MAX_EMBED_CHARS));
+    const { data } = await cloudflare<{ data: number[][] }>(
+      `/ai/run/${EMBEDDING_MODEL}`,
+      JSON.stringify({ text: texts }),
+      'application/json'
+    );
 
-  // Process entries
-  console.log('\n--- Processing knowledge entries ---');
-  for (const entry of entries) {
-    try {
-      // Combine question with keywords for better embedding
-      const textToEmbed = entry.keywords
-        ? `${entry.question} ${entry.keywords.join(' ')}`
-        : entry.question;
-
-      const embedding = await generateEmbedding(textToEmbed);
-
-      vectors.push({
-        id: entry.id,
-        values: embedding,
-        metadata: {
-          type: 'faq',
+    const ndjson = batch
+      .map((entry, i) => {
+        const metadata: KnowledgeMetadata = {
           category: entry.category,
           question: entry.question,
-          answer: entry.answer,
-          keywords: entry.keywords,
-        },
-      });
-
-      processed++;
-      if (processed % 10 === 0 || processed === entries.length) {
-        console.log(`Progress: ${processed}/${entries.length} (${Math.round((processed / entries.length) * 100)}%)`);
-      }
-
-      // Rate limit: 1 request per 100ms
-      await new Promise((r) => setTimeout(r, 100));
-    } catch (error) {
-      console.error(`Error processing entry ${entry.id}:`, error);
-    }
+          answer: entry.answer.slice(0, MAX_ANSWER_CHARS),
+        };
+        return JSON.stringify({ id: entry.id, values: data[i], metadata });
+      })
+      .join('\n');
+    await cloudflare(`/vectorize/v2/indexes/${INDEX_NAME}/upsert`, ndjson, 'application/x-ndjson');
+    console.log(`Uploaded ${Math.min(start + BATCH_SIZE, entries.length)}/${entries.length}`);
   }
 
-  // Upload to Vectorize in batches
-  console.log(`\n--- Uploading ${vectors.length} vectors to Vectorize ---`);
-  const BATCH_SIZE = 100;
-
-  for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
-    const batch = vectors.slice(i, i + BATCH_SIZE);
-    console.log(
-      `Uploading batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(vectors.length / BATCH_SIZE)}...`
-    );
-
-    try {
-      await uploadVectors(batch);
-    } catch (error) {
-      console.error(`Error uploading batch:`, error);
-    }
-
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  console.log('\n=== Done! ===');
-  console.log(`Total vectors uploaded: ${vectors.length}`);
+  console.log('Done. Vectorize applies the changes within a few seconds.');
 }
 
-// Run main
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});

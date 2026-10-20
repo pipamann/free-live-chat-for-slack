@@ -1,12 +1,19 @@
 {
   "name": "free-live-chat-for-slack",
-  "version": "1.0.0",
-  "private": false,
+  "version": "1.1.0",
+  "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p scripts",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "check": "npm run typecheck && npm test && npm run build",
     "db:migrate": "wrangler d1 migrations apply live-chat-db --remote",
     "db:migrate:local": "wrangler d1 migrations apply live-chat-db --local",
     "vectorize:create": "wrangler vectorize create support-knowledge-base --dimensions=1024 --metric=cosine",
@@ -14,9 +21,12 @@
     "models:test": "tsx scripts/test-models.ts"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250121.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.3",
-    "wrangler": "^4.7.1"
+    "@cloudflare/vitest-plugin": "^1.4.6",
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.151.3"
   }
 }

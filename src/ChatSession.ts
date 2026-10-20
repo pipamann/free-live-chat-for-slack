@@ -1,1040 +1,755 @@
-import type { Env, ChatMessage, ChatState, WebSocketMessage, CustomerMessage, EmailSubmission, VisitorInfo, FileAttachment, SlackFile } from './types';
-import { generateBotResponse } from './bot';
-import { BOT_NAME, EMAIL_REGEX, EMAIL_CAPTURED_RESPONSE } from './prompts';
+import { DurableObject } from 'cloudflare:workers';
+import type {
+  ChatMessage,
+  ChatState,
+  ChatStatus,
+  ClientMessage,
+  Env,
+  FileAttachment,
+  PendingUpload,
+  ServerMessage,
+  SlackFile,
+  VisitorInfo,
+} from './types';
+import {
+  MAX_FILE_SIZE,
+  MAX_MESSAGE_LENGTH,
+  MAX_MESSAGES_PER_MINUTE,
+  MAX_MESSAGES_PER_SESSION,
+  MAX_UPLOADS_PER_SESSION,
+  SESSION_RESUME_TTL_MS,
+  SESSION_RETENTION_MS,
+  STAGE_1_DELAY_MS,
+  STAGE_2_DELAY_MS,
+  UPLOAD_RESERVATION_TTL_MS,
+  BOT_DEBOUNCE_MS,
+} from './config';
+import { SLACK_TEXTS, VISITOR_TEXTS } from './texts';
+import {
+  downloadSlackFile,
+  escapeSlackText,
+  isSlackConfigured,
+  postSlackMessage,
+  quoteForSlack,
+  slackToPlainText,
+  uploadFileToSlackThread,
+} from './slack';
+import { contentDisposition, fileKey, normalizeMimeType, sanitizeFilename } from './files';
+import { generateBotResponse, isBotEnabled } from './bot';
+import { BOT_NAME } from './prompts';
 
-const TIMEOUT_MS = 60_000; // 60 seconds
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-const ALLOWED_MIME_TYPES = [
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-  'application/pdf',
-  'text/plain',
-];
+const STATE_KEY = 'chatState';
+const MAX_SOCKETS_PER_SESSION = 20;
+const EMAIL_IN_TEXT = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const EMAIL = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/;
+const PHONE = /^\+?[\d\s()./-]{6,30}$/;
 
-// SSRF validation - only allow Slack file URLs
-function isValidSlackFileUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return ['files.slack.com', 'files-origin.slack.com'].includes(parsed.hostname);
-  } catch {
-    return false;
-  }
-}
+/**
+ * One Durable Object per chat. It holds the transcript, the visitor's WebSocket connections
+ * (with hibernation, so idle chats cost nothing) and the link to the chat's Slack thread.
+ * The Worker in index.ts calls the public methods over RPC.
+ */
+export class ChatSession extends DurableObject<Env> {
+  private chat: ChatState | null = null;
+  private recentMessageTimes: number[] = [];
+  private botTimer: ReturnType<typeof setTimeout> | null = null;
+  private slackQueue: Promise<void> = Promise.resolve();
 
-// Sanitize filename - remove path traversal and dangerous characters
-function sanitizeFilename(filename: string): string {
-  return filename
-    .replace(/[\/\\]/g, '') // Remove path separators
-    .replace(/\.\./g, '') // Remove parent directory references
-    .replace(/[<>:"|?*]/g, '') // Remove Windows-forbidden chars
-    .slice(0, 255); // Limit length
-}
-
-// Country code to flag emoji mapping
-function countryToFlag(countryCode: string | undefined): string {
-  if (!countryCode || countryCode.length !== 2) return '🌍';
-  const codePoints = countryCode
-    .toUpperCase()
-    .split('')
-    .map((char) => 127397 + char.charCodeAt(0));
-  return String.fromCodePoint(...codePoints);
-}
-
-// Country code to name (common countries)
-function countryCodeToName(code: string | undefined): string {
-  const countries: Record<string, string> = {
-    DE: 'Deutschland',
-    AT: 'Österreich',
-    CH: 'Schweiz',
-    US: 'USA',
-    GB: 'UK',
-    FR: 'Frankreich',
-    NL: 'Niederlande',
-    BE: 'Belgien',
-    IT: 'Italien',
-    ES: 'Spanien',
-  };
-  return code ? countries[code] || code : 'Unbekannt';
-}
-
-// Parse user agent for browser and OS
-function parseUserAgent(ua: string | undefined): { browser: string; os: string; device: string } {
-  if (!ua) return { browser: 'Unbekannt', os: 'Unbekannt', device: 'Unbekannt' };
-
-  // Browser detection
-  let browser = 'Unbekannt';
-  if (ua.includes('Firefox')) browser = 'Firefox';
-  else if (ua.includes('Edg/')) browser = 'Edge';
-  else if (ua.includes('Chrome')) browser = 'Chrome';
-  else if (ua.includes('Safari')) browser = 'Safari';
-  else if (ua.includes('Opera') || ua.includes('OPR')) browser = 'Opera';
-
-  // OS detection
-  let os = 'Unbekannt';
-  if (ua.includes('Windows')) os = 'Windows';
-  else if (ua.includes('Mac OS')) os = 'Mac';
-  else if (ua.includes('Linux')) os = 'Linux';
-  else if (ua.includes('Android')) os = 'Android';
-  else if (ua.includes('iPhone') || ua.includes('iPad')) os = 'iOS';
-
-  // Device type
-  let device = 'Desktop';
-  if (ua.includes('Mobile') || ua.includes('Android') || ua.includes('iPhone')) {
-    device = 'Mobile';
-  } else if (ua.includes('iPad') || ua.includes('Tablet')) {
-    device = 'Tablet';
-  }
-
-  return { browser, os, device };
-}
-const GRACE_PERIOD_MS = 5_000; // 5 second grace period
-const MAX_MESSAGE_LENGTH = 1000;
-const MAX_MESSAGES_PER_MINUTE = 10;
-const HEARTBEAT_INTERVAL_MS = 30_000;
-const BOT_DEBOUNCE_MS = 2_000; // Wait 2s for follow-up messages before bot responds
-
-export class ChatSession implements DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
-  private websockets: Set<WebSocket> = new Set();
-  private chatState: ChatState | null = null;
-  private messageTimestamps: number[] = [];
-  private heartbeatInterval: number | null = null;
-  private botDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
-
-    // Restore WebSockets from hibernation
-    this.state.getWebSockets().forEach((ws) => {
-      this.websockets.add(ws);
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Answers the widget's keep-alive pings without waking the object from hibernation
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
+    ctx.blockConcurrencyWhile(async () => {
+      const stored = await ctx.storage.get<ChatState>(STATE_KEY);
+      this.chat = stored ? withDefaults(stored) : null;
+      // The bot may have been switched off since this chat started
+      if (this.chat && !isBotEnabled(env)) this.chat.botActive = false;
     });
   }
+
+  // ---------------------------------------------------------------------------
+  // RPC methods called by the Worker
+  // ---------------------------------------------------------------------------
+
+  /** Creates the chat. Never overwrites an existing one. */
+  async init(params: { sessionName: string; visitorInfo?: VisitorInfo; country?: string }): Promise<void> {
+    if (this.chat) return;
+    this.chat = {
+      sessionId: this.ctx.id.toString(),
+      sessionName: params.sessionName,
+      status: 'active',
+      messages: [],
+      createdAt: Date.now(),
+      visitorInfo: params.visitorInfo,
+      country: params.country,
+      botActive: isBotEnabled(this.env),
+      uploadCount: 0,
+      pendingUploads: {},
+      files: {},
+      slackSyncedCount: 0,
+    };
+    await this.save();
+    await this.scheduleAlarm();
+  }
+
+  /** True if the visitor can continue this chat. Refreshes the page they are on. */
+  async resume(visitorInfo?: VisitorInfo): Promise<boolean> {
+    const chat = this.chat;
+    if (!chat || chat.status === 'ended' || !this.isWithinResumeWindow()) return false;
+    if (visitorInfo) {
+      chat.visitorInfo = visitorInfo;
+      await this.save();
+    }
+    return true;
+  }
+
+  /** Reserves an upload slot. The visitor then sends the file to /upload/complete. */
+  async reserveUpload(
+    file: Omit<PendingUpload, 'expiresAt'>
+  ): Promise<{ fileId: string; expiresAt: number } | { error: string; status: number }> {
+    const chat = this.chat;
+    if (!chat || chat.status === 'ended' || !this.isWithinResumeWindow()) {
+      return { error: 'Chat not found or already closed', status: 404 };
+    }
+    if (chat.uploadCount >= MAX_UPLOADS_PER_SESSION) {
+      return { error: VISITOR_TEXTS.tooManyUploads, status: 429 };
+    }
+    const now = Date.now();
+    for (const [id, pending] of Object.entries(chat.pendingUploads)) {
+      if (pending.expiresAt < now) delete chat.pendingUploads[id];
+    }
+    const fileId = crypto.randomUUID();
+    const expiresAt = now + UPLOAD_RESERVATION_TTL_MS;
+    chat.pendingUploads[fileId] = { ...file, expiresAt };
+    chat.uploadCount++;
+    await this.save();
+    return { fileId, expiresAt };
+  }
+
+  /** Redeems a reservation exactly once. */
+  async claimUpload(fileId: string): Promise<PendingUpload | null> {
+    const chat = this.chat;
+    const pending = chat?.pendingUploads[fileId];
+    if (!chat || !pending) return null;
+    delete chat.pendingUploads[fileId];
+    await this.save();
+    if (pending.expiresAt < Date.now() || chat.status === 'ended') return null;
+    return pending;
+  }
+
+  /** Shows a file the visitor uploaded (already stored in R2) and forwards it to Slack. */
+  async addVisitorFile(attachment: FileAttachment, key: string): Promise<void> {
+    const chat = this.chat;
+    if (!chat) return;
+    chat.files[attachment.id] = key;
+    await this.addVisitorMessage(newMessage('customer', '', { attachments: [attachment] }));
+  }
+
+  /** R2 key of a file in this chat, while the chat can still be opened by the visitor. */
+  async getFileKey(fileId: string): Promise<string | null> {
+    if (!this.chat || !this.isWithinResumeWindow()) return null;
+    return this.chat.files[fileId] ?? null;
+  }
+
+  /** A reply a team member wrote in the chat's Slack thread. */
+  async staffReply(reply: { text: string; staffName?: string; files?: SlackFile[] }): Promise<void> {
+    const chat = this.chat;
+    if (!chat) return;
+
+    const attachments = reply.files?.length ? await this.storeSlackFiles(reply.files) : [];
+    let content = slackToPlainText(reply.text).trim().slice(0, 10_000);
+    if (!content && attachments.length === 0) {
+      if (!reply.files?.length) return;
+      content = VISITOR_TEXTS.fileFailed;
+    }
+
+    // A human took over: no more bot replies or automatic messages
+    this.cancelBot();
+    chat.botActive = false;
+    const statusChanged = chat.status === 'active' || chat.status === 'escalated';
+    if (statusChanged) chat.status = 'answered';
+
+    const message = newMessage('staff', content, {
+      staffName: reply.staffName,
+      attachments: attachments.length ? attachments : undefined,
+    });
+    chat.messages.push(message);
+    await this.save();
+    await this.scheduleAlarm();
+
+    this.broadcast({ type: 'message', payload: message });
+    if (statusChanged) {
+      this.broadcast({ type: 'status', payload: { status: chat.status } });
+      await this.updateRoutingRow({ status: chat.status });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebSocket (hibernation API)
+  // ---------------------------------------------------------------------------
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/websocket') {
-      return this.handleWebSocket(request);
-    }
-
-    if (url.pathname === '/staff-message' && request.method === 'POST') {
-      return this.handleStaffMessage(request);
-    }
-
-    if (url.pathname === '/state' && request.method === 'GET') {
-      return this.getState();
-    }
-
-    if (url.pathname === '/init' && request.method === 'POST') {
-      return this.handleInit(request);
-    }
-
-    if (url.pathname === '/update-visitor' && request.method === 'POST') {
-      return this.handleUpdateVisitor(request);
-    }
-
-    if (url.pathname === '/file-uploaded' && request.method === 'POST') {
-      return this.handleFileUploaded(request);
-    }
-
-    return new Response('Not Found', { status: 404 });
-  }
-
-  private async handleInit(request: Request): Promise<Response> {
-    try {
-      const { sessionName, visitorInfo, ipAddress, country } = (await request.json()) as {
-        sessionName?: string;
-        visitorInfo?: VisitorInfo;
-        ipAddress?: string;
-        country?: string;
-      };
-
-      this.chatState = {
-        sessionId: this.state.id.toString(),
-        sessionName, // Store UUID for R2 file paths
-        status: 'active',
-        messages: [],
-        createdAt: Date.now(),
-        visitorInfo,
-        ipAddress,
-        country,
-        // Bot state - enabled by default
-        botActive: true,
-        botMessageCount: 0,
-      };
-      await this.state.storage.put('chatState', this.chatState);
-
-      return new Response('OK', { status: 200 });
-    } catch (error) {
-      console.error('[ChatSession] Init error:', error);
-      return new Response('Error', { status: 500 });
-    }
-  }
-
-  private async handleUpdateVisitor(request: Request): Promise<Response> {
-    try {
-      // Load state from storage if not in memory
-      if (!this.chatState) {
-        this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-      }
-      if (!this.chatState) {
-        return new Response('Session not found', { status: 404 });
-      }
-
-      const { visitorInfo } = (await request.json()) as { visitorInfo?: VisitorInfo };
-
-      if (visitorInfo) {
-        this.chatState.visitorInfo = visitorInfo;
-        await this.state.storage.put('chatState', this.chatState);
-      }
-
-      return new Response('OK', { status: 200 });
-    } catch (error) {
-      console.error('[ChatSession] Update visitor error:', error);
-      return new Response('Error', { status: 500 });
-    }
-  }
-
-  private async handleFileUploaded(request: Request): Promise<Response> {
-    try {
-      // Load state from storage if not in memory
-      if (!this.chatState) {
-        this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-      }
-      if (!this.chatState) {
-        return new Response('Session not found', { status: 404 });
-      }
-
-      const { attachment } = (await request.json()) as {
-        attachment: FileAttachment;
-        r2Key: string;
-      };
-
-      // Create message with attachment
-      const message: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'customer',
-        content: '', // Empty content, file only
-        timestamp: Date.now(),
-        attachments: [attachment],
-      };
-
-      this.chatState.messages.push(message);
-      await this.state.storage.put('chatState', this.chatState);
-
-      // Broadcast to all connected clients
-      this.broadcast({
-        type: 'message',
-        payload: message,
-      });
-
-      // If this is the first message, create Slack thread
-      // (though likely the file was sent after initial message)
-      if (this.chatState.messages.filter((m) => m.role === 'customer').length === 1) {
-        await this.createSlackThread(`📎 [Datei: ${attachment.name}]`);
-        await this.state.storage.setAlarm(Date.now() + TIMEOUT_MS + GRACE_PERIOD_MS);
-      }
-
-      return new Response('OK', { status: 200 });
-    } catch (error) {
-      console.error('[ChatSession] File uploaded error:', error);
-      return new Response('Error', { status: 500 });
-    }
-  }
-
-  private async handleWebSocket(request: Request): Promise<Response> {
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (upgradeHeader !== 'websocket') {
+    if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
-
-    const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
-
-    // Accept with hibernation support
-    this.state.acceptWebSocket(server);
-    this.websockets.add(server);
-
-    // Load or initialize chat state
-    if (!this.chatState) {
-      // First try to load from storage (e.g., after hibernation)
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-
-      // If still not found, create new state
-      if (!this.chatState) {
-        const sessionId = this.state.id.toString();
-        this.chatState = {
-          sessionId,
-          status: 'active',
-          messages: [],
-          createdAt: Date.now(),
-          botActive: true,
-          botMessageCount: 0,
-        };
-        await this.state.storage.put('chatState', this.chatState);
-      }
+    const chat = this.chat;
+    // Chats are only created by /start (which checks Turnstile), never by connecting
+    if (!chat || !this.isWithinResumeWindow()) {
+      return new Response('Chat not found', { status: 404 });
+    }
+    if (this.ctx.getWebSockets().length >= MAX_SOCKETS_PER_SESSION) {
+      return new Response('Too many connections', { status: 429 });
     }
 
-    // Send current state to new connection
-    this.sendToSocket(server, {
-      type: 'status',
-      payload: {
-        status: this.chatState.status,
-        messages: this.chatState.messages,
-      },
-    });
-
+    const { 0: client, 1: server } = new WebSocketPair();
+    this.ctx.acceptWebSocket(server);
+    send(server, { type: 'status', payload: { status: chat.status, messages: chat.messages } });
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== 'string') return;
-
-    try {
-      const data = JSON.parse(message) as CustomerMessage | EmailSubmission | { type: 'pong' };
-
-      if (data.type === 'pong') {
-        // Client responded to ping, connection is alive
-        return;
-      }
-
-      if (data.type === 'message') {
-        await this.handleCustomerMessage(data as CustomerMessage, ws);
-      } else if (data.type === 'email') {
-        await this.handleEmailSubmission(data as EmailSubmission);
-      }
-    } catch (error) {
-      console.error('[ChatSession] Error processing message:', error);
-      this.sendToSocket(ws, {
-        type: 'error',
-        payload: { message: 'Invalid message format' },
-      });
+  async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer): Promise<void> {
+    const chat = this.chat;
+    if (!chat) {
+      ws.close(4404, 'Chat not found');
+      return;
     }
-  }
 
-  async webSocketClose(ws: WebSocket): Promise<void> {
-    this.websockets.delete(ws);
+    let data: ClientMessage;
+    try {
+      if (typeof raw !== 'string' || raw.length > 16_384) throw new Error('Unexpected frame');
+      data = JSON.parse(raw);
+    } catch {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.invalidMessage } });
+      return;
+    }
 
-    // If no more connections and chat not ended, keep state for potential reconnect
-    if (this.websockets.size === 0 && this.chatState?.status !== 'ended') {
-      // Session state persists in DO storage
-      console.log(`[ChatSession] All connections closed for session ${this.chatState?.sessionId}`);
+    if (data?.type === 'message') {
+      await this.onVisitorText(ws, data);
+    } else if (data?.type === 'email') {
+      await this.onContactDetails(ws, data);
+    } else if (data?.type !== 'pong') {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.invalidMessage } });
     }
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('[ChatSession] WebSocket error:', error);
-    this.websockets.delete(ws);
   }
+
+  // ---------------------------------------------------------------------------
+  // Alarm: automatic replies while waiting for staff, and deletion of old chats
+  // ---------------------------------------------------------------------------
 
   async alarm(): Promise<void> {
-    // Load state from storage if not in memory (e.g., after hibernation)
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
+    const chat = this.chat;
+    if (!chat) {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      return;
     }
 
-    if (!this.chatState) return;
-
-    // Check if we're still in active status (no staff response)
-    if (this.chatState.status === 'active') {
-      // Add grace period - check if staff or bot replied in the last few seconds
-      const lastMessage = this.chatState.messages[this.chatState.messages.length - 1];
-      if (lastMessage?.role === 'staff') {
-        // Staff replied during grace period, don't escalate
-        return;
-      }
-      // If bot responded recently and is still active (and it wasn't a handoff), extend the timeout
-      if (lastMessage?.role === 'bot' && this.chatState.botActive && !lastMessage.isHandoff) {
-        // Bot is actively handling the conversation, wait for more interaction
-        await this.state.storage.setAlarm(Date.now() + TIMEOUT_MS + GRACE_PERIOD_MS);
-        return;
-      }
-
-      // Request email from customer
-      this.chatState.status = 'escalated';
-
-      // Add escalation message as a bot message so it appears in chat
-      const escalationMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'bot',
-        content: 'Es tut mir leid, ich konnte leider keinen freien Mitarbeiter erreichen. Sie können aber gerne weiter mit mir chatten! Falls Sie möchten, dass sich ein Mitarbeiter bei Ihnen meldet, können Sie unten Ihre E-Mail-Adresse hinterlassen.',
-        timestamp: Date.now(),
-      };
-      this.chatState.messages.push(escalationMessage);
-
-      await this.state.storage.put('chatState', this.chatState);
-
-      // Send the message to customers
-      this.broadcast({
-        type: 'message',
-        payload: escalationMessage,
-      });
-
-      this.broadcast({
-        type: 'status',
-        payload: {
-          status: 'escalated',
-        },
-      });
-    }
-  }
-
-  private async handleCustomerMessage(data: CustomerMessage, senderWs: WebSocket): Promise<void> {
-    // Load state from storage if not in memory (e.g., after hibernation)
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-    }
-
-    if (!this.chatState) return;
-
-    // Rate limiting
     const now = Date.now();
-    this.messageTimestamps = this.messageTimestamps.filter((t) => now - t < 60_000);
-    if (this.messageTimestamps.length >= MAX_MESSAGES_PER_MINUTE) {
-      this.sendToSocket(senderWs, {
-        type: 'error',
-        payload: { message: 'Zu viele Nachrichten. Bitte warten Sie einen Moment.' },
-      });
-      return;
-    }
-    this.messageTimestamps.push(now);
-
-    // Validate and sanitize message
-    const content = data.content?.trim().slice(0, MAX_MESSAGE_LENGTH);
-    if (!content) return;
-
-    // Create message
-    const message: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: 'customer',
-      content,
-      timestamp: now,
-    };
-
-    this.chatState.messages.push(message);
-    await this.state.storage.put('chatState', this.chatState);
-
-    // Send acknowledgment to sender (with message ID for client-side tracking)
-    this.sendToSocket(senderWs, {
-      type: 'message_ack',
-      payload: { id: message.id },
-    });
-
-    // Broadcast to OTHER connected clients (e.g., other tabs)
-    this.broadcastExcept(senderWs, {
-      type: 'message',
-      payload: message,
-    });
-
-    // Reset alarm on EVERY customer message to keep session alive while user is active
-    if (this.chatState.status === 'active') {
-      await this.state.storage.setAlarm(Date.now() + TIMEOUT_MS + GRACE_PERIOD_MS);
-    }
-
-    // If this is the first message, post to Slack
-    if (this.chatState.messages.filter((m) => m.role === 'customer').length === 1) {
-      await this.createSlackThread(content);
-    } else if (this.chatState.slackThreadTs) {
-      // Post follow-up message to existing thread
-      await this.postToSlackThread(content);
-    }
-
-    // Check if customer provided an email address
-    const extractedEmail = this.extractEmail(content);
-    if (extractedEmail && !this.chatState.customerEmail) {
-      await this.handleEmailExtracted(extractedEmail);
-      return; // Don't trigger bot response - we already responded
-    }
-
-    // Trigger bot response if bot is active and session is still active
-    if (this.chatState.botActive && this.chatState.status === 'active') {
-      this.scheduleBotResponse(content);
-    }
-  }
-
-  /**
-   * Extract email address from message content
-   */
-  private extractEmail(content: string): string | null {
-    const match = content.match(EMAIL_REGEX);
-    return match ? match[0].toLowerCase() : null;
-  }
-
-  /**
-   * Handle when customer provides their email address
-   */
-  private async handleEmailExtracted(email: string): Promise<void> {
-    if (!this.chatState) return;
-
-    // Store the email
-    this.chatState.customerEmail = email;
-    await this.state.storage.put('chatState', this.chatState);
-
-    // Create confirmation message from bot
-    const botMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: 'bot',
-      content: EMAIL_CAPTURED_RESPONSE,
-      timestamp: Date.now(),
-    };
-
-    this.chatState.messages.push(botMessage);
-    await this.state.storage.put('chatState', this.chatState);
-
-    // Broadcast confirmation to customer
-    this.broadcast({
-      type: 'message',
-      payload: botMessage,
-    });
-
-    // Notify staff in Slack thread
-    if (this.chatState.slackThreadTs) {
-      await this.postToSlackThread(`📧 E-Mail erfasst: ${email}`);
-    }
-
-    // Update D1 with customer email
-    try {
-      await this.env.DB.prepare(
-        'UPDATE chat_sessions SET customer_email = ? WHERE id = ?'
-      )
-        .bind(email, this.chatState.sessionId)
-        .run();
-    } catch (error) {
-      console.error('[ChatSession] D1 email update error:', error);
-    }
-
-    console.log(`[ChatSession] Email captured: ${email}`);
-  }
-
-  private async handleEmailSubmission(data: EmailSubmission): Promise<void> {
-    // Load state from storage if not in memory (e.g., after hibernation)
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-    }
-
-    if (!this.chatState) return;
-
-    const email = data.email?.trim().toLowerCase();
-    if (!email || !this.isValidEmail(email)) {
-      this.broadcast({
-        type: 'error',
-        payload: { message: 'Bitte geben Sie eine gültige E-Mail-Adresse ein.' },
-      });
+    if (now >= deletionTime(chat)) {
+      await this.purge();
       return;
     }
 
-    this.chatState.customerEmail = email;
-    this.chatState.status = 'ended';
-    await this.state.storage.put('chatState', this.chatState);
-
-    // Create Freshdesk ticket
-    await this.createFreshdeskTicket(email);
-
-    // Update Slack thread
-    if (this.chatState.slackThreadTs) {
-      await this.postToSlackThread(`📧 Kunde hat E-Mail hinterlassen: ${email}\n🎫 Freshdesk-Ticket wurde erstellt.`);
+    if (this.waitingForStaff() && chat.firstCustomerMessageAt) {
+      if (!chat.stage1Sent && now >= chat.firstCustomerMessageAt + STAGE_1_DELAY_MS) {
+        chat.stage1Sent = true;
+        await this.addAutoReply(VISITOR_TEXTS.stage1);
+      }
+      if (!chat.stage2Sent && now >= chat.firstCustomerMessageAt + STAGE_2_DELAY_MS) {
+        chat.stage2Sent = true;
+        chat.status = 'escalated';
+        await this.addAutoReply(VISITOR_TEXTS.stage2);
+        this.broadcast({ type: 'status', payload: { status: 'escalated' } });
+        await this.updateRoutingRow({ status: 'escalated' });
+        await this.postNotice(SLACK_TEXTS.stageNotice(escapeSlackText(VISITOR_TEXTS.stage2)));
+      }
     }
-
-    // Update D1
-    try {
-      await this.env.DB.prepare(
-        'UPDATE chat_sessions SET status = ?, customer_email = ? WHERE id = ?'
-      )
-        .bind('ended', email, this.chatState.sessionId)
-        .run();
-    } catch (error) {
-      console.error('[ChatSession] D1 update error:', error);
-    }
-
-    this.broadcast({
-      type: 'status',
-      payload: {
-        status: 'ended',
-        message: 'Vielen Dank! Wir haben ein Support-Ticket erstellt und melden uns bei Ihnen per E-Mail.',
-      },
-    });
+    await this.scheduleAlarm();
   }
 
-  private async handleStaffMessage(request: Request): Promise<Response> {
-    // Load state from storage if not in memory (e.g., after hibernation)
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
+  /** Runs whichever comes first: the next automatic reply or the deletion of the chat. */
+  private async scheduleAlarm(): Promise<void> {
+    const chat = this.chat;
+    if (!chat) return;
+    const times = [deletionTime(chat)];
+    if (this.waitingForStaff() && chat.firstCustomerMessageAt) {
+      if (!chat.stage1Sent) times.push(chat.firstCustomerMessageAt + STAGE_1_DELAY_MS);
+      else if (!chat.stage2Sent) times.push(chat.firstCustomerMessageAt + STAGE_2_DELAY_MS);
     }
-
-    if (!this.chatState) {
-      return new Response('Session not found', { status: 404 });
-    }
-
-    try {
-      const body = (await request.json()) as {
-        text: string;
-        staffName?: string;
-        pendingFiles?: SlackFile[];
-        sessionName?: string;
-      };
-      const content = body.text?.trim() || '';
-      const hasPendingFiles = body.pendingFiles && body.pendingFiles.length > 0;
-
-      // Allow empty text if there are pending files
-      if (!content && !hasPendingFiles) {
-        return new Response('Empty message', { status: 400 });
-      }
-
-      // Disable bot when staff replies
-      if (this.chatState.botActive) {
-        this.chatState.botActive = false;
-        // Cancel any pending bot response
-        if (this.botDebounceTimer) {
-          clearTimeout(this.botDebounceTimer);
-          this.botDebounceTimer = null;
-        }
-      }
-
-      // Update status if this is first staff response
-      if (this.chatState.status === 'active') {
-        this.chatState.status = 'answered';
-        // Cancel the timeout alarm
-        await this.state.storage.deleteAlarm();
-
-        // Update D1
-        try {
-          await this.env.DB.prepare('UPDATE chat_sessions SET status = ? WHERE id = ?')
-            .bind('answered', this.chatState.sessionId)
-            .run();
-        } catch (error) {
-          console.error('[ChatSession] D1 update error:', error);
-        }
-      }
-
-      const message: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'staff',
-        content,
-        timestamp: Date.now(),
-        staffName: body.staffName,
-      };
-
-      // Process pending files if any
-      if (hasPendingFiles && body.sessionName) {
-        const attachments = await this.processSlackFiles(body.pendingFiles!, body.sessionName);
-        if (attachments.length > 0) {
-          message.attachments = attachments;
-        } else if (!content) {
-          // All files failed and no text provided - show error instead of blank message
-          message.content = '[Fehler: Datei konnte nicht geladen werden]';
-        }
-      }
-
-      this.chatState.messages.push(message);
-      await this.state.storage.put('chatState', this.chatState);
-
-      // Broadcast to customer
-      this.broadcast({
-        type: 'message',
-        payload: message,
-      });
-
-      this.broadcast({
-        type: 'status',
-        payload: { status: this.chatState.status },
-      });
-
-      return new Response('OK', { status: 200 });
-    } catch (error) {
-      console.error('[ChatSession] Staff message error:', error);
-      return new Response('Error', { status: 500 });
-    }
+    await this.ctx.storage.setAlarm(Math.min(...times));
   }
 
-  /**
-   * Download files from Slack and upload to R2
-   * Processes files in parallel for better performance
-   */
-  private async processSlackFiles(files: SlackFile[], sessionName: string): Promise<FileAttachment[]> {
-    const processFile = async (file: SlackFile): Promise<FileAttachment | null> => {
+  /** Automatic replies only run while nobody (neither staff nor the bot) has picked up the chat. */
+  private waitingForStaff(): boolean {
+    return this.chat?.status === 'active' && !this.chat.botActive;
+  }
+
+  private async addAutoReply(text: string): Promise<void> {
+    const message = newMessage('bot', text);
+    this.chat!.messages.push(message);
+    await this.save();
+    this.broadcast({ type: 'message', payload: message });
+  }
+
+  /** Deletes the transcript, files and routing row. Slack keeps its copy of the thread. */
+  private async purge(): Promise<void> {
+    const chat = this.chat!;
+    const keys = Object.values(chat.files);
+    if (keys.length) await this.env.FILES_BUCKET.delete(keys);
+    try {
+      await this.env.DB.prepare('DELETE FROM chat_sessions WHERE id = ?').bind(chat.sessionId).run();
+    } catch (error) {
+      console.error('[ChatSession] D1 delete failed:', error);
+    }
+    for (const ws of this.ctx.getWebSockets()) {
       try {
-        // Double-check SSRF validation
-        if (!isValidSlackFileUrl(file.url_private)) {
-          console.warn(`[ChatSession] Skipping file with invalid URL: ${file.url_private}`);
-          return null;
-        }
-
-        // Validate MIME type
-        if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-          console.warn(`[ChatSession] Skipping unsupported file type: ${file.mimetype}`);
-          return null;
-        }
-
-        // Validate size
-        if (file.size > MAX_FILE_SIZE) {
-          console.warn(`[ChatSession] Skipping oversized file: ${file.size} bytes`);
-          return null;
-        }
-
-        // Download file from Slack
-        // Use manual redirect to strip Auth header when following redirect to S3
-        let downloadResponse = await fetch(file.url_private, {
-          headers: {
-            Authorization: `Bearer ${this.env.SLACK_BOT_TOKEN}`,
-          },
-          redirect: 'manual',
-        });
-
-        // Follow redirect (usually to S3) without the Authorization header
-        if (downloadResponse.status === 301 || downloadResponse.status === 302) {
-          const location = downloadResponse.headers.get('Location');
-          if (location) {
-            downloadResponse = await fetch(location);
-          }
-        }
-
-        if (!downloadResponse.ok) {
-          console.error(`[ChatSession] Failed to download Slack file: ${downloadResponse.status}`);
-          return null;
-        }
-
-        // Generate file ID and R2 key
-        const fileId = crypto.randomUUID();
-        const sanitizedName = sanitizeFilename(file.name);
-        const r2Key = `${sessionName}/${fileId}/${sanitizedName}`;
-
-        // Upload to R2
-        await this.env.FILES_BUCKET.put(r2Key, downloadResponse.body, {
-          httpMetadata: {
-            contentType: file.mimetype,
-            contentDisposition: `attachment; filename="${sanitizedName}"`,
-          },
-          customMetadata: {
-            sessionId: sessionName,
-            source: 'slack-staff',
-            slackFileId: file.id,
-            uploadedAt: new Date().toISOString(),
-          },
-        });
-
-        console.log(`[ChatSession] Uploaded Slack file ${file.name} to R2: ${r2Key}`);
-
-        return {
-          id: fileId,
-          name: sanitizedName,
-          mimeType: file.mimetype,
-          size: file.size,
-          url: `/file/${sessionName}/${fileId}`,
-        };
-      } catch (error) {
-        console.error(`[ChatSession] Error processing Slack file ${file.name}:`, error);
-        return null;
+        ws.close(1000, 'Chat expired');
+      } catch {
+        // ignore
       }
-    };
-
-    // Process all files in parallel
-    const results = await Promise.all(files.map(processFile));
-
-    // Filter out failed uploads (nulls)
-    return results.filter((attachment): attachment is FileAttachment => attachment !== null);
+    }
+    this.chat = null;
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
   }
 
-  /**
-   * Schedule a bot response with debouncing
-   * Waits for follow-up messages before generating a response
-   */
-  private scheduleBotResponse(content: string): void {
-    // Cancel any existing debounce timer
-    if (this.botDebounceTimer) {
-      clearTimeout(this.botDebounceTimer);
-    }
+  // ---------------------------------------------------------------------------
+  // Visitor actions
+  // ---------------------------------------------------------------------------
 
-    // Schedule the bot response after debounce period
-    this.botDebounceTimer = setTimeout(() => {
-      this.state.waitUntil(this.executeBotResponse());
-    }, BOT_DEBOUNCE_MS);
+  private async onVisitorText(ws: WebSocket, data: Extract<ClientMessage, { type: 'message' }>): Promise<void> {
+    const content = typeof data.content === 'string' ? data.content.trim().slice(0, MAX_MESSAGE_LENGTH) : '';
+    if (!content || !this.allowVisitorAction(ws)) return;
+
+    const message = newMessage('customer', content);
+    const clientId = typeof data.clientId === 'string' ? data.clientId.slice(0, 64) : undefined;
+    await this.addVisitorMessage(message, ws, clientId);
+
+    const chat = this.chat!;
+    const email = chat.customerEmail ? null : EMAIL_IN_TEXT.exec(content)?.[0].toLowerCase();
+    if (email) {
+      await this.captureEmail(email);
+      if (chat.botActive) return; // the bot already confirmed, no need for an answer on top
+    }
+    if (chat.botActive && chat.status === 'active') this.scheduleBot();
   }
 
-  /**
-   * Execute the bot response generation and send to customer
-   */
-  private async executeBotResponse(): Promise<void> {
-    // Reload state in case it changed
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-    }
+  /** Stores a visitor message, tells the other tabs and forwards it to Slack. */
+  private async addVisitorMessage(message: ChatMessage, sender?: WebSocket, clientId?: string): Promise<void> {
+    const chat = this.chat!;
+    chat.messages.push(message);
+    const isFirst = !chat.firstCustomerMessageAt;
+    if (isFirst) chat.firstCustomerMessageAt = message.timestamp;
+    await this.save();
 
-    if (!this.chatState || !this.chatState.botActive || this.chatState.status !== 'active') {
+    if (sender) send(sender, { type: 'message_ack', payload: { id: message.id, clientId } });
+    this.broadcast({ type: 'message', payload: message }, sender);
+    // Later messages do not push the automatic replies back, or the visitor would never be offered the contact form
+    if (isFirst) await this.scheduleAlarm();
+
+    await this.enqueueSlack(() => this.syncVisitorMessages());
+  }
+
+  /** Rate limit and size cap for everything a visitor sends. */
+  private allowVisitorAction(ws: WebSocket): boolean {
+    const now = Date.now();
+    this.recentMessageTimes = this.recentMessageTimes.filter((t) => now - t < 60_000);
+    if (this.recentMessageTimes.length >= MAX_MESSAGES_PER_MINUTE) {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.tooManyMessages } });
+      return false;
+    }
+    if (this.chat!.messages.length >= MAX_MESSAGES_PER_SESSION) {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.sessionFull } });
+      return false;
+    }
+    this.recentMessageTimes.push(now);
+    return true;
+  }
+
+  /** An email address the visitor typed into a normal message. */
+  private async captureEmail(email: string): Promise<void> {
+    const chat = this.chat!;
+    chat.customerEmail = email;
+    await this.save();
+    // Confirm when someone is "talking" to the visitor or we asked for contact details
+    if (chat.botActive || chat.status === 'escalated') await this.addAutoReply(VISITOR_TEXTS.emailNoted);
+    await this.postNotice(escapeSlackText(SLACK_TEXTS.emailCaptured(email)));
+    await this.updateRoutingRow({ customer_email: email });
+  }
+
+  /** The contact form shown after escalation. Accepted once per chat. */
+  private async onContactDetails(ws: WebSocket, data: Extract<ClientMessage, { type: 'email' }>): Promise<void> {
+    const chat = this.chat!;
+    if (chat.status === 'ended') {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.alreadyEnded } });
+      return;
+    }
+    if (!this.allowVisitorAction(ws)) return;
+
+    const email = typeof data.email === 'string' ? data.email.trim().toLowerCase() : '';
+    const phone = typeof data.phone === 'string' ? data.phone.trim() : '';
+    const emailOk = email.length <= 254 && EMAIL.test(email);
+    const phoneOk = PHONE.test(phone);
+    if ((email && !emailOk) || (phone && !phoneOk) || (!emailOk && !phoneOk)) {
+      send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.invalidContact } });
       return;
     }
 
-    // Get the latest customer message
-    const customerMessages = this.chatState.messages.filter((m) => m.role === 'customer');
-    if (customerMessages.length === 0) return;
+    if (emailOk) chat.customerEmail = email;
+    if (phoneOk) chat.customerPhone = phone;
+    chat.status = 'ended';
+    this.cancelBot();
+    await this.save();
+    await this.scheduleAlarm();
+    this.broadcast({ type: 'status', payload: { status: 'ended', message: VISITOR_TEXTS.contactReceived } });
 
-    const latestMessage = customerMessages[customerMessages.length - 1];
-
-    try {
-      // Send typing indicator
-      this.broadcast({
-        type: 'typing',
-        payload: { sender: 'bot', name: BOT_NAME },
-      });
-
-      // Generate bot response
-      const response = await generateBotResponse(
-        this.env,
-        this.chatState.messages,
-        latestMessage.content
-      );
-
-      // Re-check state after async AI call (staff may have replied during generation)
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-      if (!this.chatState || !this.chatState.botActive || this.chatState.status !== 'active') {
-        console.log('[ChatSession] Bot response discarded - state changed during generation');
-        return;
-      }
-
-      // Clear typing indicator (by sending the actual message)
-
-      // Create bot message
-      const botMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'bot',
-        content: response.content,
-        timestamp: Date.now(),
-        botConfidence: response.confidence,
-        isHandoff: response.needsHandoff,
-      };
-
-      // If bot detected handoff needed, escalate immediately
-      if (response.needsHandoff) {
-        this.chatState.status = 'escalated';
-      }
-
-      this.chatState.messages.push(botMessage);
-      this.chatState.botMessageCount = (this.chatState.botMessageCount || 0) + 1;
-      this.chatState.lastBotResponse = Date.now();
-      await this.state.storage.put('chatState', this.chatState);
-
-      // Broadcast to customer
-      this.broadcast({
-        type: 'message',
-        payload: botMessage,
-      });
-
-      // If handoff, broadcast status change immediately so UI shows email form
-      if (response.needsHandoff) {
-        this.broadcast({
-          type: 'status',
-          payload: { status: 'escalated' },
-        });
-      }
-
-      // Post bot message to Slack thread (so staff can see the conversation)
-      if (this.chatState.slackThreadTs) {
-        await this.postToSlackThread(`🤖 ${BOT_NAME}: ${response.content}`);
-      }
-
-      // Reset escalation alarm since bot is actively helping
-      // Only if bot is still providing value (not a handoff response)
-      if (!response.needsHandoff) {
-        await this.state.storage.setAlarm(Date.now() + TIMEOUT_MS + GRACE_PERIOD_MS);
-      }
-
-      console.log(
-        `[ChatSession] Bot responded with confidence ${response.confidence.toFixed(2)}, handoff: ${response.needsHandoff}`
-      );
-    } catch (error) {
-      console.error('[ChatSession] Bot response error:', error);
-      // Don't send error to customer - just let the escalation timer handle it
-    }
+    const ticket = await this.sendTicket();
+    const lines = [SLACK_TEXTS.contactLeft];
+    if (emailOk) lines.push(`• ${SLACK_TEXTS.email}: ${escapeSlackText(email)}`);
+    if (phoneOk) lines.push(`• ${SLACK_TEXTS.phone}: ${escapeSlackText(phone)}`);
+    if (ticket !== null) lines.push(ticket ? SLACK_TEXTS.ticketCreated : SLACK_TEXTS.ticketFailed);
+    await this.postNotice(lines.join('\n'));
+    await this.updateRoutingRow({ status: 'ended', customer_email: chat.customerEmail ?? null });
   }
 
-  private async getState(): Promise<Response> {
-    // Always load from storage to handle hibernation correctly
-    if (!this.chatState) {
-      this.chatState = (await this.state.storage.get<ChatState>('chatState')) ?? null;
-    }
-    return new Response(JSON.stringify(this.chatState), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  private async createSlackThread(firstMessage: string): Promise<void> {
-    if (!this.env.SLACK_BOT_TOKEN || !this.env.SLACK_CHANNEL_ID) {
-      console.warn('[ChatSession] Slack not configured');
-      return;
-    }
-
-    try {
-      // Build visitor info section
-      const visitorLines: string[] = [];
-      if (this.chatState?.country || this.chatState?.visitorInfo?.userAgent) {
-        const flag = countryToFlag(this.chatState.country);
-        const countryName = countryCodeToName(this.chatState.country);
-        const { browser, os, device } = parseUserAgent(this.chatState.visitorInfo?.userAgent);
-        visitorLines.push(`*Besucher*: ${flag} ${countryName} | ${browser}/${os} | ${device}`);
-      }
-      if (this.chatState?.visitorInfo?.pageUrl) {
-        // Extract path from URL
-        try {
-          const pageUrl = new URL(this.chatState.visitorInfo.pageUrl);
-          visitorLines.push(`*Seite*: ${pageUrl.pathname}${pageUrl.search}`);
-        } catch {
-          visitorLines.push(`*Seite*: ${this.chatState.visitorInfo.pageUrl}`);
-        }
-      }
-      if (this.chatState?.visitorInfo?.referrer) {
-        // Extract domain from referrer
-        try {
-          const referrerUrl = new URL(this.chatState.visitorInfo.referrer);
-          visitorLines.push(`*Referrer*: ${referrerUrl.hostname}`);
-        } catch {
-          visitorLines.push(`*Referrer*: ${this.chatState.visitorInfo.referrer}`);
-        }
-      }
-
-      const visitorSection = visitorLines.length > 0 ? visitorLines.join('\n') + '\n\n' : '';
-
-      const response = await fetch('https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.env.SLACK_BOT_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          channel: this.env.SLACK_CHANNEL_ID,
-          text: `💬 *Neue Live-Chat Anfrage*\n\n${visitorSection}> ${firstMessage}`,
-          metadata: {
-            event_type: 'live_chat_session',
-            event_payload: {
-              session_id: this.chatState?.sessionId,
-            },
-          },
-        }),
-      });
-
-      const result = (await response.json()) as { ok: boolean; ts?: string; error?: string };
-      if (result.ok && result.ts) {
-        this.chatState!.slackThreadTs = result.ts;
-        await this.state.storage.put('chatState', this.chatState);
-
-        // Save to D1 for webhook routing
-        try {
-          await this.env.DB.prepare(
-            'INSERT INTO chat_sessions (id, slack_thread_ts, status, ip_address, session_name) VALUES (?, ?, ?, ?, ?)'
-          )
-            .bind(this.chatState!.sessionId, result.ts, 'active', this.chatState!.ipAddress || null, this.chatState!.sessionName || null)
-            .run();
-        } catch (error) {
-          console.error('[ChatSession] D1 insert error:', error);
-        }
-      } else {
-        console.error('[ChatSession] Slack API error:', result.error);
-      }
-    } catch (error) {
-      console.error('[ChatSession] Slack post error:', error);
-    }
-  }
-
-  private async postToSlackThread(message: string): Promise<void> {
-    if (!this.env.SLACK_BOT_TOKEN || !this.chatState?.slackThreadTs) return;
-
-    try {
-      await fetch('https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.env.SLACK_BOT_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          channel: this.env.SLACK_CHANNEL_ID,
-          thread_ts: this.chatState.slackThreadTs,
-          text: message,
-        }),
-      });
-    } catch (error) {
-      console.error('[ChatSession] Slack thread post error:', error);
-    }
-  }
-
-  private async createFreshdeskTicket(email: string): Promise<void> {
-    if (!this.env.N8N_WEBHOOK_URL) {
-      console.warn('[ChatSession] N8N_WEBHOOK_URL not configured');
-      return;
-    }
-
-    // Compile chat transcript
-    const roleLabels: Record<string, string> = {
-      customer: 'Kunde',
-      staff: 'Mitarbeiter',
-      bot: 'Bot',
-    };
-    const transcript = this.chatState!.messages
-      .map((m) => `[${roleLabels[m.role] || m.role}] ${m.content}`)
+  /** Sends the transcript to TICKET_WEBHOOK_URL. Returns null if no webhook is configured. */
+  private async sendTicket(): Promise<boolean | null> {
+    const url = this.env.TICKET_WEBHOOK_URL || this.env.N8N_WEBHOOK_URL;
+    if (!url) return null;
+    const chat = this.chat!;
+    const labels: Record<ChatMessage['role'], string> = { customer: 'Visitor', staff: 'Staff', bot: 'Bot' };
+    const transcript = chat.messages
+      .map((m) => `[${labels[m.role]}] ${m.content || (m.attachments ?? []).map((a) => `[File: ${a.name}]`).join(' ')}`)
       .join('\n');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.env.TICKET_WEBHOOK_SECRET) headers.Authorization = `Bearer ${this.env.TICKET_WEBHOOK_SECRET}`;
 
     try {
-      const response = await fetch(this.env.N8N_WEBHOOK_URL, {
+      const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          email,
-          session_id: this.chatState!.sessionId,
+          email: chat.customerEmail ?? null,
+          phone: chat.customerPhone ?? null,
+          session_id: chat.sessionId,
+          slack_thread_ts: chat.slackThreadTs ?? null,
           transcript,
-          messages: this.chatState!.messages,
-          visitor_info: this.chatState!.visitorInfo,
-          country: this.chatState!.country,
+          messages: chat.messages,
+          visitor_info: chat.visitorInfo ?? null,
+          country: chat.country ?? null,
           submitted_at: new Date().toISOString(),
         }),
       });
-
-      if (!response.ok) {
-        const error = await response.text();
-        console.error('[ChatSession] n8n webhook error:', error);
-      } else {
-        console.log('[ChatSession] Ticket sent to n8n');
-      }
+      if (!response.ok) console.error(`[ChatSession] Ticket webhook returned HTTP ${response.status}`);
+      return response.ok;
     } catch (error) {
-      console.error('[ChatSession] n8n webhook error:', error);
+      console.error('[ChatSession] Ticket webhook failed:', error);
+      return false;
     }
   }
 
-  private broadcast(message: WebSocketMessage): void {
-    const data = JSON.stringify(message);
-    for (const ws of this.websockets) {
-      try {
-        ws.send(data);
-      } catch {
-        // Socket may be closed
-        this.websockets.delete(ws);
+  // ---------------------------------------------------------------------------
+  // AI bot
+  // ---------------------------------------------------------------------------
+
+  /** Waits briefly for follow-up messages, then answers them together. */
+  private scheduleBot(): void {
+    this.cancelBot();
+    this.botTimer = setTimeout(() => {
+      this.botTimer = null;
+      this.ctx.waitUntil(this.runBot());
+    }, BOT_DEBOUNCE_MS);
+  }
+
+  private cancelBot(): void {
+    if (this.botTimer) {
+      clearTimeout(this.botTimer);
+      this.botTimer = null;
+    }
+  }
+
+  private async runBot(): Promise<void> {
+    const chat = this.chat;
+    if (!chat || !chat.botActive || chat.status !== 'active') return;
+
+    this.broadcast({ type: 'typing', payload: { sender: 'bot', name: BOT_NAME } });
+    const reply = await generateBotResponse(this.env, chat.messages);
+
+    // Staff may have answered, or the visitor left their details, while the model was busy
+    if (this.chat !== chat || !chat.botActive || chat.status !== 'active') return;
+
+    const message = newMessage('bot', reply.content, { isHandoff: reply.needsHandoff || undefined });
+    chat.messages.push(message);
+    if (reply.needsHandoff) chat.status = 'escalated';
+    await this.save();
+
+    this.broadcast({ type: 'message', payload: message });
+    if (reply.needsHandoff) {
+      this.broadcast({ type: 'status', payload: { status: 'escalated' } });
+      await this.updateRoutingRow({ status: 'escalated' });
+    }
+    await this.postNotice(`${SLACK_TEXTS.botPrefix(BOT_NAME)} ${escapeSlackText(reply.content)}`);
+    console.log(
+      `[ChatSession] Bot replied (score ${reply.confidence.toFixed(2)}, handoff: ${reply.handoffReason ?? 'no'})`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Slack
+  // ---------------------------------------------------------------------------
+
+  /** Runs Slack calls one at a time, so messages keep their order and only one thread is created. */
+  private enqueueSlack(task: () => Promise<void>): Promise<void> {
+    const run = this.slackQueue.then(task).catch((error) => console.error('[ChatSession] Slack error:', error));
+    this.slackQueue = run;
+    return run;
+  }
+
+  /**
+   * Posts every visitor message that is not in Slack yet. The first one opens the thread.
+   * If Slack was unreachable, the next call catches up.
+   */
+  private async syncVisitorMessages(): Promise<void> {
+    const chat = this.chat;
+    if (!chat || !isSlackConfigured(this.env)) return;
+    const visitorMessages = chat.messages.filter((m) => m.role === 'customer');
+
+    for (const message of visitorMessages.slice(chat.slackSyncedCount)) {
+      const text = message.content
+        ? quoteForSlack(message.content)
+        : (message.attachments ?? []).map((a) => quoteForSlack(SLACK_TEXTS.fileMessage(a.name))).join('\n');
+
+      if (!chat.slackThreadTs) {
+        await this.createThread(text);
+      } else if (message.content) {
+        await postSlackMessage(this.env, text, { threadTs: chat.slackThreadTs });
       }
-    }
-  }
-
-  private broadcastExcept(excludeWs: WebSocket, message: WebSocketMessage): void {
-    const data = JSON.stringify(message);
-    for (const ws of this.websockets) {
-      if (ws === excludeWs) continue;
-      try {
-        ws.send(data);
-      } catch {
-        // Socket may be closed
-        this.websockets.delete(ws);
+      for (const attachment of message.attachments ?? []) {
+        await this.uploadVisitorFileToSlack(attachment);
       }
+      chat.slackSyncedCount++;
+      await this.save();
     }
   }
 
-  private sendToSocket(ws: WebSocket, message: WebSocketMessage): void {
+  private async createThread(firstMessage: string): Promise<void> {
+    const chat = this.chat!;
+    const text = [SLACK_TEXTS.newChat, ...visitorDetails(chat), '', firstMessage].join('\n');
+    chat.slackThreadTs = await postSlackMessage(this.env, text);
+    await this.save();
+
+    // Lets /slack-webhook find this chat when someone replies in the thread
     try {
-      ws.send(JSON.stringify(message));
-    } catch {
-      this.websockets.delete(ws);
+      await this.env.DB.prepare(
+        'INSERT OR REPLACE INTO chat_sessions (id, slack_thread_ts, status, customer_email, session_name) VALUES (?, ?, ?, ?, ?)'
+      )
+        .bind(chat.sessionId, chat.slackThreadTs, chat.status, chat.customerEmail ?? null, chat.sessionName)
+        .run();
+    } catch (error) {
+      console.error('[ChatSession] D1 insert failed, staff replies cannot be routed:', error);
     }
   }
 
-  private isValidEmail(email: string): boolean {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  /** A notice for the team (bot reply, contact details…), posted in the chat's thread. */
+  private async postNotice(text: string): Promise<void> {
+    await this.enqueueSlack(async () => {
+      await this.syncVisitorMessages();
+      const threadTs = this.chat?.slackThreadTs;
+      if (threadTs) await postSlackMessage(this.env, text, { threadTs });
+    });
   }
+
+  private async uploadVisitorFileToSlack(attachment: FileAttachment): Promise<void> {
+    const chat = this.chat!;
+    const key = chat.files[attachment.id];
+    const object = key ? await this.env.FILES_BUCKET.get(key) : null;
+    if (!object || !chat.slackThreadTs) return;
+    await uploadFileToSlackThread(
+      this.env,
+      chat.slackThreadTs,
+      { name: attachment.name, bytes: await object.arrayBuffer() },
+      escapeSlackText(SLACK_TEXTS.fileUploaded(attachment.name))
+    );
+  }
+
+  /** Copies files a team member attached in Slack to R2, so the visitor can download them. */
+  private async storeSlackFiles(files: SlackFile[]): Promise<FileAttachment[]> {
+    const chat = this.chat!;
+    if (!chat.sessionName) return []; // chats created before v1.1 have no public ID for file URLs
+
+    const stored = await Promise.all(
+      files.slice(0, 10).map(async (file): Promise<FileAttachment | null> => {
+        const mimeType = normalizeMimeType(file.mimetype);
+        if (!mimeType || !(file.size > 0) || file.size > MAX_FILE_SIZE) {
+          console.warn(`[ChatSession] Skipping Slack file of type ${file.mimetype}, ${file.size} bytes`);
+          return null;
+        }
+        try {
+          const response = await downloadSlackFile(this.env, file);
+          const bytes = await response.arrayBuffer();
+          if (bytes.byteLength > MAX_FILE_SIZE) return null;
+          const fileId = crypto.randomUUID();
+          const name = sanitizeFilename(file.name, mimeType);
+          const key = fileKey(chat.sessionName, fileId);
+          await this.env.FILES_BUCKET.put(key, bytes, {
+            httpMetadata: { contentType: mimeType, contentDisposition: contentDisposition(name) },
+            customMetadata: { source: 'slack', slackFileId: file.id },
+          });
+          chat.files[fileId] = key;
+          return { id: fileId, name, mimeType, size: bytes.byteLength, url: `/file/${chat.sessionName}/${fileId}` };
+        } catch (error) {
+          console.error('[ChatSession] Copying a Slack file failed:', error);
+          return null;
+        }
+      })
+    );
+    return stored.filter((file): file is FileAttachment => file !== null);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  private isWithinResumeWindow(): boolean {
+    return !!this.chat && Date.now() - this.chat.createdAt < SESSION_RESUME_TTL_MS;
+  }
+
+  private async save(): Promise<void> {
+    if (this.chat) await this.ctx.storage.put(STATE_KEY, this.chat);
+  }
+
+  private async updateRoutingRow(fields: { status?: ChatStatus; customer_email?: string | null }): Promise<void> {
+    const chat = this.chat;
+    if (!chat?.slackThreadTs) return;
+    const columns = Object.keys(fields);
+    try {
+      await this.env.DB.prepare(`UPDATE chat_sessions SET ${columns.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`)
+        .bind(...Object.values(fields), chat.sessionId)
+        .run();
+    } catch (error) {
+      console.error('[ChatSession] D1 update failed:', error);
+    }
+  }
+
+  private broadcast(message: ServerMessage, except?: WebSocket): void {
+    const data = JSON.stringify(message);
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws === except) continue;
+      try {
+        ws.send(data);
+      } catch {
+        // The socket is closing
+      }
+    }
+  }
+}
+
+/**
+ * Chats the visitor never wrote in are deleted once they can no longer be resumed;
+ * real conversations are kept for the retention period.
+ */
+function deletionTime(chat: ChatState): number {
+  return chat.createdAt + (chat.firstCustomerMessageAt ? SESSION_RETENTION_MS : SESSION_RESUME_TTL_MS);
+}
+
+function send(ws: WebSocket, message: ServerMessage): void {
+  try {
+    ws.send(JSON.stringify(message));
+  } catch {
+    // The socket is closing
+  }
+}
+
+function newMessage(
+  role: ChatMessage['role'],
+  content: string,
+  extra: Partial<Pick<ChatMessage, 'staffName' | 'attachments' | 'isHandoff'>> = {}
+): ChatMessage {
+  return { id: crypto.randomUUID(), role, content, timestamp: Date.now(), ...extra };
+}
+
+/** Fills in fields added in v1.1 for chats stored by older versions, and drops the stored IP address. */
+function withDefaults(stored: ChatState & { ipAddress?: string }): ChatState {
+  const { ipAddress: _dropped, ...state } = stored;
+  const visitorMessageCount = state.messages.filter((m) => m.role === 'customer').length;
+  return {
+    ...state,
+    sessionName: state.sessionName ?? '',
+    uploadCount: state.uploadCount ?? 0,
+    pendingUploads: state.pendingUploads ?? {},
+    files: state.files ?? {},
+    slackSyncedCount: state.slackSyncedCount ?? (state.slackThreadTs ? visitorMessageCount : 0),
+  };
+}
+
+/** Lines about the visitor for the thread's first post. All values are escaped. */
+export function visitorDetails(chat: Pick<ChatState, 'country' | 'visitorInfo'>): string[] {
+  const lines: string[] = [];
+  const info = chat.visitorInfo;
+  if (chat.country || info?.userAgent) {
+    const { browser, os, device } = parseUserAgent(info?.userAgent);
+    const language = info?.language ? ` | ${info.language}` : '';
+    lines.push(`*${SLACK_TEXTS.visitor}*: ${countryLabel(chat.country)} | ${browser}/${os} | ${device}${language}`);
+  }
+  if (info?.pageUrl) {
+    let page = info.pageUrl;
+    try {
+      const url = new URL(info.pageUrl);
+      page = url.pathname + url.search;
+    } catch {
+      // keep the raw value
+    }
+    lines.push(`*${SLACK_TEXTS.page}*: ${page}`);
+  }
+  if (info?.referrer) {
+    let referrer = info.referrer;
+    try {
+      referrer = new URL(info.referrer).hostname;
+    } catch {
+      // keep the raw value
+    }
+    lines.push(`*${SLACK_TEXTS.referrer}*: ${referrer}`);
+  }
+  return lines.map(escapeSlackText);
+}
+
+function countryLabel(code: string | undefined): string {
+  if (!code || !/^[A-Z]{2}$/.test(code) || code === 'XX' || code === 'T1') return `🌍 ${SLACK_TEXTS.unknown}`;
+  const flag = String.fromCodePoint(...[...code].map((char) => 127397 + char.charCodeAt(0)));
+  let name = code;
+  try {
+    name = new Intl.DisplayNames(['en'], { type: 'region' }).of(code) ?? code;
+  } catch {
+    // keep the code
+  }
+  return `${flag} ${name}`;
+}
+
+export function parseUserAgent(ua: string | undefined): { browser: string; os: string; device: string } {
+  const unknown = SLACK_TEXTS.unknown;
+  if (!ua) return { browser: unknown, os: unknown, device: unknown };
+
+  let browser = unknown;
+  if (ua.includes('Firefox/')) browser = 'Firefox';
+  else if (ua.includes('Edg/')) browser = 'Edge';
+  else if (ua.includes('OPR/') || ua.includes('Opera')) browser = 'Opera';
+  else if (ua.includes('Chrome/') || ua.includes('CriOS/')) browser = 'Chrome';
+  else if (ua.includes('Safari/')) browser = 'Safari';
+
+  let os = unknown;
+  if (/iPhone|iPad|iPod/.test(ua)) os = 'iOS';
+  else if (ua.includes('Android')) os = 'Android';
+  else if (ua.includes('Windows')) os = 'Windows';
+  else if (ua.includes('Mac OS')) os = 'macOS';
+  else if (ua.includes('Linux')) os = 'Linux';
+
+  let device = 'Desktop';
+  if (/iPad|Tablet/.test(ua)) device = 'Tablet';
+  else if (/Mobile|iPhone|Android/.test(ua)) device = 'Mobile';
+
+  return { browser, os, device };
 }

@@ -1,0 +1,20 @@
+[
+  {
+    "id": "shipping-time",
+    "category": "Shipping",
+    "question": "How long does shipping take?",
+    "answer": "Orders ship within one business day. Delivery takes two to three business days within Germany and three to five days within the EU."
+  },
+  {
+    "id": "reset-password",
+    "category": "Account",
+    "question": "How do I reset my password?",
+    "answer": "Click \"Forgot password\" on the login page at https://app.example.com/login and follow the link in the email we send you. The link is valid for one hour."
+  },
+  {
+    "id": "pricing-plans",
+    "category": "Pricing",
+    "question": "What plans do you offer?",
+    "answer": "There are two plans: Starter for 9 € per month and Pro for 29 € per month. Both can be cancelled monthly. Details: https://example.com/pricing"
+  }
+]
