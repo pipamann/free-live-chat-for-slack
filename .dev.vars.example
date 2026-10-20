@@ -1,0 +1,18 @@
+# Copy to .dev.vars for `npm run dev`. Never commit real secrets.
+
+# Local test page at http://localhost:8787/demo
+ENABLE_DEMO_PAGE=true
+ALLOWED_ORIGINS=http://localhost:8787,http://localhost:4321,http://localhost:3000
+
+# Cloudflare's Turnstile test keys: always pass, work on localhost
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+
+# Your Slack app (api.slack.com/apps). Without real values the chat works, but nothing reaches Slack.
+SLACK_BOT_TOKEN=xoxb-your-token
+SLACK_SIGNING_SECRET=your-signing-secret
+SLACK_CHANNEL_ID=C0123456789
+
+# Optional
+# TICKET_WEBHOOK_URL=https://your-n8n.example.com/webhook/live-chat
+# TICKET_WEBHOOK_SECRET=change-me
