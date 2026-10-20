@@ -51,7 +51,7 @@ export function mockOutboundFetch(options: { slackDown?: boolean } = {}) {
       switch (url.pathname) {
         case '/api/chat.postMessage':
           call.ts = `1700000000.${String(++lastTs).padStart(6, '0')}`;
-          return Response.json({ ok: true, ts: call.ts });
+          return Response.json({ ok: true, ts: call.ts, channel: body.channel });
         case '/api/users.info':
           return Response.json({ ok: true, user: { real_name: 'Alex Example', profile: { display_name: 'Alex' } } });
         case '/api/files.getUploadURLExternal':

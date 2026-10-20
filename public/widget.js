@@ -50,7 +50,7 @@
   const MAX_MESSAGE_LENGTH = 1000;
   const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 20000];
   const EMAIL = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/;
-  const PHONE = /^\+?[\d\s()./-]{6,30}$/;
+  const PHONE = /^\+?[\d ()./-]{6,30}$/;
   const URL_PATTERN = /https?:\/\/[^\s<>"']+/g;
 
   // ---------------------------------------------------------------------------
@@ -446,11 +446,10 @@
   }
 
   async function post(path, body) {
-    const isForm = body instanceof FormData;
     const response = await fetch(config.serviceUrl + path, {
       method: 'POST',
-      headers: isForm ? undefined : { 'Content-Type': 'application/json' },
-      body: isForm ? body : JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
     let data = {};
     try {
@@ -690,12 +689,12 @@
         size: file.size,
       });
       if (!reservation.ok) throw new Error(reservation.data.error || `HTTP ${reservation.status}`);
-      const form = new FormData();
-      form.append('file', file);
-      form.append('fileId', reservation.data.fileId);
-      form.append('sessionId', state.sessionId);
-      const result = await post('/upload/complete', form);
-      if (!result.ok) throw new Error(result.data.error || `HTTP ${result.status}`);
+      const query = new URLSearchParams({ sessionId: state.sessionId, fileId: reservation.data.fileId });
+      const response = await fetch(`${config.serviceUrl}/upload/complete?${query}`, { method: 'POST', body: file });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || `HTTP ${response.status}`);
+      }
       // The file shows up as a message from the server
     } catch (error) {
       showError(`${texts.uploadFailed}: ${error.message}`);

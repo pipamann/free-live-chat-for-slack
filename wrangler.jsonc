@@ -71,12 +71,14 @@
     "SLACK_CHANNEL_ID": "YOUR_SLACK_CHANNEL_ID",
     // Exact origins that may embed the chat, comma-separated. Add http://localhost:4321 etc. for local testing.
     "ALLOWED_ORIGINS": "https://your-website.com"
+    // Only if you really want new chats without Turnstile spam protection:
+    // "DISABLE_TURNSTILE": "true"
   },
 
   // Secrets, set with `npx wrangler secret put <NAME>` (locally: .dev.vars):
   //   SLACK_BOT_TOKEN         Bot token (xoxb-…)
   //   SLACK_SIGNING_SECRET    Verifies that webhook calls come from Slack
-  //   TURNSTILE_SECRET_KEY    Spam protection for new chats (strongly recommended)
+  //   TURNSTILE_SECRET_KEY    Spam protection for new chats (required unless DISABLE_TURNSTILE is "true")
   //   TICKET_WEBHOOK_URL      Optional: receives the transcript when a visitor leaves contact details
   //   TICKET_WEBHOOK_SECRET   Optional: sent to that webhook as "Authorization: Bearer <secret>"
 

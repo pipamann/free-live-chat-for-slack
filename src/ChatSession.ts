@@ -13,6 +13,7 @@ import type {
 } from './types';
 import {
   MAX_FILE_SIZE,
+  MAX_FRAMES_PER_MINUTE,
   MAX_MESSAGE_LENGTH,
   MAX_MESSAGES_PER_MINUTE,
   MAX_MESSAGES_PER_SESSION,
@@ -35,14 +36,14 @@ import {
   uploadFileToSlackThread,
 } from './slack';
 import { contentDisposition, fileKey, normalizeMimeType, sanitizeFilename } from './files';
-import { generateBotResponse, isBotEnabled } from './bot';
+import { generateBotResponse, isBotEnabled, unansweredVisitorText } from './bot';
 import { BOT_NAME } from './prompts';
 
 const STATE_KEY = 'chatState';
 const MAX_SOCKETS_PER_SESSION = 20;
 const EMAIL_IN_TEXT = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 const EMAIL = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/;
-const PHONE = /^\+?[\d\s()./-]{6,30}$/;
+const PHONE = /^\+?[\d ()./-]{6,30}$/;
 
 /**
  * One Durable Object per chat. It holds the transcript, the visitor's WebSocket connections
@@ -51,8 +52,10 @@ const PHONE = /^\+?[\d\s()./-]{6,30}$/;
  */
 export class ChatSession extends DurableObject<Env> {
   private chat: ChatState | null = null;
-  private recentMessageTimes: number[] = [];
+  private frameTimes: number[] = [];
   private botTimer: ReturnType<typeof setTimeout> | null = null;
+  private botBusy = false;
+  private botRerun = false;
   private slackQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -83,6 +86,8 @@ export class ChatSession extends DurableObject<Env> {
       visitorInfo: params.visitorInfo,
       country: params.country,
       botActive: isBotEnabled(this.env),
+      botReplies: 0,
+      recentMessageTimes: [],
       uploadCount: 0,
       pendingUploads: {},
       files: {},
@@ -96,7 +101,7 @@ export class ChatSession extends DurableObject<Env> {
   async resume(visitorInfo?: VisitorInfo): Promise<boolean> {
     const chat = this.chat;
     if (!chat || chat.status === 'ended' || !this.isWithinResumeWindow()) return false;
-    if (visitorInfo) {
+    if (visitorInfo && JSON.stringify(visitorInfo) !== JSON.stringify(chat.visitorInfo)) {
       chat.visitorInfo = visitorInfo;
       await this.save();
     }
@@ -152,9 +157,13 @@ export class ChatSession extends DurableObject<Env> {
   }
 
   /** A reply a team member wrote in the chat's Slack thread. */
-  async staffReply(reply: { text: string; staffName?: string; files?: SlackFile[] }): Promise<void> {
+  async staffReply(reply: { text: string; staffName?: string; files?: SlackFile[]; channel?: string }): Promise<void> {
     const chat = this.chat;
     if (!chat) return;
+    if (chat.slackChannel && reply.channel !== chat.slackChannel) {
+      console.warn('[ChatSession] Ignoring a reply from another channel');
+      return;
+    }
 
     const attachments = reply.files?.length ? await this.storeSlackFiles(reply.files) : [];
     let content = slackToPlainText(reply.text).trim().slice(0, 10_000);
@@ -213,6 +222,14 @@ export class ChatSession extends DurableObject<Env> {
       ws.close(4404, 'Chat not found');
       return;
     }
+    // Every frame wakes this object, so all of them count, not only chat messages
+    const now = Date.now();
+    this.frameTimes = this.frameTimes.filter((t) => now - t < 60_000);
+    if (this.frameTimes.length >= MAX_FRAMES_PER_MINUTE) {
+      ws.close(1008, 'Too many messages');
+      return;
+    }
+    this.frameTimes.push(now);
 
     let data: ClientMessage;
     try {
@@ -255,6 +272,8 @@ export class ChatSession extends DurableObject<Env> {
     }
 
     if (this.waitingForStaff() && chat.firstCustomerMessageAt) {
+      // Also a retry for visitor messages that could not be posted to Slack
+      await this.enqueueSlack(() => this.syncVisitorMessages());
       if (!chat.stage1Sent && now >= chat.firstCustomerMessageAt + STAGE_1_DELAY_MS) {
         chat.stage1Sent = true;
         await this.addAutoReply(VISITOR_TEXTS.stage1);
@@ -298,12 +317,15 @@ export class ChatSession extends DurableObject<Env> {
   /** Deletes the transcript, files and routing row. Slack keeps its copy of the thread. */
   private async purge(): Promise<void> {
     const chat = this.chat!;
-    const keys = Object.values(chat.files);
-    if (keys.length) await this.env.FILES_BUCKET.delete(keys);
     try {
+      const keys = Object.values(chat.files);
+      if (keys.length) await this.env.FILES_BUCKET.delete(keys);
       await this.env.DB.prepare('DELETE FROM chat_sessions WHERE id = ?').bind(chat.sessionId).run();
     } catch (error) {
-      console.error('[ChatSession] D1 delete failed:', error);
+      // Keep everything and retry, rather than leave the email address behind in D1
+      console.error('[ChatSession] Deleting the chat failed, retrying in an hour:', error);
+      await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+      return;
     }
     for (const ws of this.ctx.getWebSockets()) {
       try {
@@ -354,19 +376,20 @@ export class ChatSession extends DurableObject<Env> {
     await this.enqueueSlack(() => this.syncVisitorMessages());
   }
 
-  /** Rate limit and size cap for everything a visitor sends. */
+  /** Rate limit and size cap for everything a visitor sends. The times are saved with the next change. */
   private allowVisitorAction(ws: WebSocket): boolean {
+    const chat = this.chat!;
     const now = Date.now();
-    this.recentMessageTimes = this.recentMessageTimes.filter((t) => now - t < 60_000);
-    if (this.recentMessageTimes.length >= MAX_MESSAGES_PER_MINUTE) {
+    chat.recentMessageTimes = chat.recentMessageTimes.filter((t) => now - t < 60_000);
+    if (chat.recentMessageTimes.length >= MAX_MESSAGES_PER_MINUTE) {
       send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.tooManyMessages } });
       return false;
     }
-    if (this.chat!.messages.length >= MAX_MESSAGES_PER_SESSION) {
+    if (chat.messages.length >= MAX_MESSAGES_PER_SESSION) {
       send(ws, { type: 'error', payload: { message: VISITOR_TEXTS.sessionFull } });
       return false;
     }
-    this.recentMessageTimes.push(now);
+    chat.recentMessageTimes.push(now);
     return true;
   }
 
@@ -423,8 +446,16 @@ export class ChatSession extends DurableObject<Env> {
     const chat = this.chat!;
     const labels: Record<ChatMessage['role'], string> = { customer: 'Visitor', staff: 'Staff', bot: 'Bot' };
     const transcript = chat.messages
-      .map((m) => `[${labels[m.role]}] ${m.content || (m.attachments ?? []).map((a) => `[File: ${a.name}]`).join(' ')}`)
+      .map((m) => {
+        const text = m.content || (m.attachments ?? []).map((a) => `[File: ${a.name}]`).join(' ');
+        // Indented continuation lines, so a message cannot fake a line from someone else
+        return `[${labels[m.role]}] ${text.replace(/\n/g, '\n    ')}`;
+      })
       .join('\n');
+    // File URLs contain the chat's ID, which works like a password: they stay out of third-party systems
+    const messages = chat.messages.map((m) =>
+      m.attachments ? { ...m, attachments: m.attachments.map(({ url: _url, ...file }) => file) } : m
+    );
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.env.TICKET_WEBHOOK_SECRET) headers.Authorization = `Bearer ${this.env.TICKET_WEBHOOK_SECRET}`;
 
@@ -438,7 +469,7 @@ export class ChatSession extends DurableObject<Env> {
           session_id: chat.sessionId,
           slack_thread_ts: chat.slackThreadTs ?? null,
           transcript,
-          messages: chat.messages,
+          messages,
           visitor_info: chat.visitorInfo ?? null,
           country: chat.country ?? null,
           submitted_at: new Date().toISOString(),
@@ -472,15 +503,43 @@ export class ChatSession extends DurableObject<Env> {
     }
   }
 
+  /** One answer at a time; messages that arrive meanwhile are answered in the next round. */
   private async runBot(): Promise<void> {
-    const chat = this.chat;
-    if (!chat || !chat.botActive || chat.status !== 'active') return;
+    if (this.botBusy) {
+      this.botRerun = true;
+      return;
+    }
+    this.botBusy = true;
+    try {
+      await this.answerWithBot();
+    } catch (error) {
+      console.error('[ChatSession] Bot failed:', error);
+    } finally {
+      this.botBusy = false;
+      if (this.botRerun) {
+        this.botRerun = false;
+        this.scheduleBot();
+      }
+    }
+  }
 
+  private async answerWithBot(): Promise<void> {
+    const chat = this.chat;
+    if (!chat || !chat.botActive || chat.status !== 'active' || !unansweredVisitorText(chat.messages)) return;
+
+    const visitorCount = chat.messages.filter((m) => m.role === 'customer').length;
     this.broadcast({ type: 'typing', payload: { sender: 'bot', name: BOT_NAME } });
-    const reply = await generateBotResponse(this.env, chat.messages);
+    const reply = await generateBotResponse(this.env, chat.messages, chat.botReplies);
+    chat.botReplies++;
 
     // Staff may have answered, or the visitor left their details, while the model was busy
     if (this.chat !== chat || !chat.botActive || chat.status !== 'active') return;
+    // New questions arrived meanwhile: answer everything together instead of an outdated reply
+    if (chat.messages.filter((m) => m.role === 'customer').length !== visitorCount) {
+      this.botRerun = true;
+      await this.save();
+      return;
+    }
 
     const message = newMessage('bot', reply.content, { isHandoff: reply.needsHandoff || undefined });
     chat.messages.push(message);
@@ -539,7 +598,9 @@ export class ChatSession extends DurableObject<Env> {
   private async createThread(firstMessage: string): Promise<void> {
     const chat = this.chat!;
     const text = [SLACK_TEXTS.newChat, ...visitorDetails(chat), '', firstMessage].join('\n');
-    chat.slackThreadTs = await postSlackMessage(this.env, text);
+    const { ts, channel } = await postSlackMessage(this.env, text);
+    chat.slackThreadTs = ts;
+    chat.slackChannel = channel;
     await this.save();
 
     // Lets /slack-webhook find this chat when someone replies in the thread
@@ -683,6 +744,8 @@ function withDefaults(stored: ChatState & { ipAddress?: string }): ChatState {
     pendingUploads: state.pendingUploads ?? {},
     files: state.files ?? {},
     slackSyncedCount: state.slackSyncedCount ?? (state.slackThreadTs ? visitorMessageCount : 0),
+    botReplies: state.botReplies ?? 0,
+    recentMessageTimes: state.recentMessageTimes ?? [],
   };
 }
 
@@ -695,26 +758,21 @@ export function visitorDetails(chat: Pick<ChatState, 'country' | 'visitorInfo'>)
     const language = info?.language ? ` | ${info.language}` : '';
     lines.push(`*${SLACK_TEXTS.visitor}*: ${countryLabel(chat.country)} | ${browser}/${os} | ${device}${language}`);
   }
-  if (info?.pageUrl) {
-    let page = info.pageUrl;
-    try {
-      const url = new URL(info.pageUrl);
-      page = url.pathname + url.search;
-    } catch {
-      // keep the raw value
-    }
-    lines.push(`*${SLACK_TEXTS.page}*: ${page}`);
-  }
-  if (info?.referrer) {
-    let referrer = info.referrer;
-    try {
-      referrer = new URL(info.referrer).hostname;
-    } catch {
-      // keep the raw value
-    }
-    lines.push(`*${SLACK_TEXTS.referrer}*: ${referrer}`);
-  }
+  // Only values that parse as URLs are shown, never free text from the visitor
+  const page = parseUrl(info?.pageUrl);
+  if (page) lines.push(`*${SLACK_TEXTS.page}*: ${page.pathname}${page.search}`);
+  const referrer = parseUrl(info?.referrer);
+  if (referrer) lines.push(`*${SLACK_TEXTS.referrer}*: ${referrer.hostname}`);
   return lines.map(escapeSlackText);
+}
+
+function parseUrl(value: string | undefined): URL | null {
+  try {
+    const url = value ? new URL(value) : null;
+    return url && (url.protocol === 'https:' || url.protocol === 'http:') ? url : null;
+  } catch {
+    return null;
+  }
 }
 
 function countryLabel(code: string | undefined): string {

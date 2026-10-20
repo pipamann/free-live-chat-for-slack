@@ -19,11 +19,13 @@ export interface Env {
   ENABLE_DEMO_PAGE?: string;
   /** Turnstile site key for the /demo page. Your own site passes it to the widget instead. */
   TURNSTILE_SITE_KEY?: string;
+  /** Set to "true" to allow new chats without Turnstile. Without it, a missing secret blocks new chats. */
+  DISABLE_TURNSTILE?: string;
 
   // Secrets (wrangler secret put)
   SLACK_BOT_TOKEN: string;
   SLACK_SIGNING_SECRET: string;
-  /** Strongly recommended: without it anyone can open chats from a script. */
+  /** Required for new chats unless DISABLE_TURNSTILE is "true". */
   TURNSTILE_SECRET_KEY?: string;
   /** Optional: receives a JSON payload when a visitor leaves contact details (n8n, Zapier, your helpdesk…). */
   TICKET_WEBHOOK_URL?: string;
@@ -92,11 +94,17 @@ export interface ChatState {
   visitorInfo?: VisitorInfo;
   country?: string;
   slackThreadTs?: string;
-  /** How many visitor messages have been posted to Slack (the rest is retried on the next message). */
+  /** Channel ID Slack returned for the thread; replies from elsewhere are ignored. */
+  slackChannel?: string;
+  /** How many visitor messages have been posted to Slack (the rest is retried later). */
   slackSyncedCount: number;
   customerEmail?: string;
   customerPhone?: string;
   botActive: boolean;
+  /** Model calls made for this chat, capped by BOT_MAX_REPLIES_PER_CHAT. */
+  botReplies: number;
+  /** When the visitor's recent messages were sent, for the per-minute limit (survives hibernation). */
+  recentMessageTimes: number[];
   firstCustomerMessageAt?: number;
   stage1Sent?: boolean;
   stage2Sent?: boolean;
@@ -143,6 +151,8 @@ export interface SlackMessageEvent {
 export interface SlackEventPayload {
   type: 'url_verification' | 'event_callback' | string;
   challenge?: string;
+  /** The installation that receives the event; for a bot, `user_id` is the bot's own user. */
+  authorizations?: Array<{ user_id?: string; is_bot?: boolean }>;
   team_id?: string;
   api_app_id?: string;
   event?: SlackMessageEvent;

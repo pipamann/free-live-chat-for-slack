@@ -22,7 +22,7 @@ export const CONTACT_INFO = {
 
 export const BOT_NAME = BOT_CONFIG.botName;
 
-function contactLines(): string[] {
+export function contactLines(): string[] {
   const lines: string[] = [];
   if (CONTACT_INFO.phone) lines.push(`Phone: ${CONTACT_INFO.phone}`);
   if (CONTACT_INFO.email) lines.push(`Email: ${CONTACT_INFO.email}`);

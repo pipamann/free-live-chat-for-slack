@@ -7,6 +7,7 @@ import {
   isAllowedOrigin,
   isUuid,
   json,
+  rateLimitKey,
   readBodyText,
   readJsonObject,
   sanitizeVisitorInfo,
@@ -42,7 +43,7 @@ export default {
         return await handleUploadStart(request, env, origin);
       }
       if (pathname === '/upload/complete' && method === 'POST') {
-        return await handleUploadComplete(request, env, ctx, origin);
+        return await handleUploadComplete(request, env, ctx, origin, url);
       }
       const file = /^\/file\/([^/]+)\/([^/]+)$/.exec(pathname);
       if (file && method === 'GET') {
@@ -93,7 +94,7 @@ async function handleStart(request: Request, env: Env, origin: string | null): P
   // Everything below creates a new chat, so it is where spam protection applies
   const ip = request.headers.get('CF-Connecting-IP');
   if (env.START_LIMITER && ip) {
-    const { success } = await env.START_LIMITER.limit({ key: ip });
+    const { success } = await env.START_LIMITER.limit({ key: rateLimitKey(ip) });
     if (!success) {
       return json({ error: 'Too many new chats. Please try again in a minute.' }, 429, cors);
     }
@@ -105,6 +106,10 @@ async function handleStart(request: Request, env: Env, origin: string | null): P
     if (!(await verifyTurnstile(body.turnstile_token, ip, env.TURNSTILE_SECRET_KEY))) {
       return json({ error: 'Turnstile verification failed' }, 403, cors);
     }
+  } else if (env.DISABLE_TURNSTILE !== 'true') {
+    // A forgotten secret must not silently switch the spam protection off
+    console.error('[start] TURNSTILE_SECRET_KEY is not set. Set it, or set DISABLE_TURNSTILE to "true".');
+    return json({ error: 'The chat is not configured yet' }, 503, cors);
   }
 
   const sessionId = crypto.randomUUID();
@@ -156,7 +161,8 @@ async function handleSlackWebhook(request: Request, env: Env, ctx: ExecutionCont
     return new Response(payload.challenge ?? '', { headers: { 'Content-Type': 'text/plain' } });
   }
   const event = payload.event;
-  if (payload.type !== 'event_callback' || !event || !isStaffThreadReply(event, env)) {
+  const botUserId = payload.authorizations?.find((authorization) => authorization.is_bot)?.user_id;
+  if (payload.type !== 'event_callback' || !event || !isStaffThreadReply(event, env, botUserId)) {
     return new Response('OK');
   }
   // Slack retries events it thinks we missed; handle each one once
@@ -176,9 +182,15 @@ async function handleSlackWebhook(request: Request, env: Env, ctx: ExecutionCont
 
 /**
  * A human reply inside a thread of the support channel. Replies starting with `//` are
- * internal notes for colleagues and stay in Slack.
+ * internal notes for colleagues and stay in Slack. Messages of the app itself (visitor
+ * messages, files it uploaded) are recognized by `bot_id` and by the bot's user ID.
  */
-export function isStaffThreadReply(event: SlackMessageEvent, env: Pick<Env, 'SLACK_CHANNEL_ID'>): boolean {
+export function isStaffThreadReply(
+  event: SlackMessageEvent,
+  env: Pick<Env, 'SLACK_CHANNEL_ID'>,
+  botUserId?: string
+): boolean {
+  // A channel name instead of an ID would never match; the chat also checks the thread's channel
   const channelMatches = !/^[CG][A-Z0-9]+$/.test(env.SLACK_CHANNEL_ID) || event.channel === env.SLACK_CHANNEL_ID;
   return (
     event.type === 'message' &&
@@ -187,6 +199,7 @@ export function isStaffThreadReply(event: SlackMessageEvent, env: Pick<Env, 'SLA
     event.thread_ts !== event.ts &&
     !event.bot_id &&
     !!event.user &&
+    event.user !== botUserId &&
     (event.subtype === undefined || event.subtype === 'file_share' || event.subtype === 'thread_broadcast') &&
     !/^\s*\/\//.test(event.text ?? '')
   );
@@ -210,7 +223,7 @@ async function forwardStaffReply(env: Env, durableObjectId: string, event: Slack
     const staffName = await getSlackUserName(env, event.user!);
     const files = (event.files ?? []).filter((file) => isSlackFileUrl(file.url_private));
     const stub = env.CHAT_SESSION.get(env.CHAT_SESSION.idFromString(durableObjectId));
-    await stub.staffReply({ text: event.text ?? '', staffName, files });
+    await stub.staffReply({ text: event.text ?? '', staffName, files, channel: event.channel });
   } catch (error) {
     console.error('[slack-webhook] Delivering a staff reply failed:', error);
   }
@@ -245,62 +258,58 @@ async function handleUploadStart(request: Request, env: Env, origin: string | nu
   return json({ fileId: result.fileId, expiresAt: result.expiresAt, maxSize: MAX_FILE_SIZE }, 200, cors);
 }
 
-// POST /upload/complete: multipart form with `file`, `fileId` and `sessionId`
+// POST /upload/complete?sessionId=…&fileId=…: the file itself as the request body
 async function handleUploadComplete(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  origin: string | null
+  origin: string | null,
+  url: URL
 ): Promise<Response> {
   const cors = corsHeaders(origin, env);
   if (!isAllowedOrigin(origin, env)) {
     return json({ error: 'Origin not allowed' }, 403, cors);
   }
-  const declaredLength = Number(request.headers.get('Content-Length'));
-  if (!declaredLength) {
+  const sessionId = url.searchParams.get('sessionId');
+  const fileId = url.searchParams.get('fileId');
+  if (!isUuid(sessionId) || !isUuid(fileId) || !request.body) {
+    return json({ error: 'Missing required fields' }, 400, cors);
+  }
+  const length = Number(request.headers.get('Content-Length'));
+  if (!length) {
     return json({ error: 'Content-Length required' }, 411, cors);
   }
-  if (declaredLength > MAX_FILE_SIZE + 64 * 1024) {
+  if (length > MAX_FILE_SIZE) {
     return json({ error: VISITOR_TEXTS.fileTooLarge }, 413, cors);
   }
 
-  let form: FormData;
-  try {
-    form = await request.formData();
-  } catch {
-    return json({ error: 'Invalid form data' }, 400, cors);
-  }
-  const file = form.get('file');
-  const fileId = form.get('fileId');
-  const sessionId = form.get('sessionId');
-  if (!(file instanceof File) || !isUuid(fileId) || !isUuid(sessionId)) {
-    return json({ error: 'Missing required fields' }, 400, cors);
-  }
-
+  // Redeem the reservation before reading the body, so nobody can make the Worker hold files it never asked for
   const stub = sessionStub(env, sessionId);
   const pending = await stub.claimUpload(fileId);
   if (!pending) {
     return json({ error: 'Upload expired or not found' }, 400, cors);
   }
-  if (file.size === 0 || file.size > MAX_FILE_SIZE || file.size > pending.size) {
-    return json({ error: VISITOR_TEXTS.fileTooLarge }, 400, cors);
-  }
-  const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());
-  if (!contentMatchesType(pending.mimeType, head)) {
-    return json({ error: VISITOR_TEXTS.fileContentMismatch }, 400, cors);
+  if (length !== pending.size) {
+    return json({ error: 'File size does not match' }, 400, cors);
   }
 
+  // Streamed straight into R2; the content check then reads back only the first bytes
   const key = fileKey(sessionId, fileId);
-  await env.FILES_BUCKET.put(key, file, {
+  await env.FILES_BUCKET.put(key, request.body, {
     httpMetadata: { contentType: pending.mimeType, contentDisposition: contentDisposition(pending.name) },
     customMetadata: { source: 'visitor' },
   });
+  const head = await env.FILES_BUCKET.get(key, { range: { offset: 0, length: 4096 } });
+  if (!head || !contentMatchesType(pending.mimeType, new Uint8Array(await head.arrayBuffer()))) {
+    await env.FILES_BUCKET.delete(key);
+    return json({ error: VISITOR_TEXTS.fileContentMismatch }, 400, cors);
+  }
 
   const attachment: FileAttachment = {
     id: fileId,
     name: pending.name,
     mimeType: pending.mimeType,
-    size: file.size,
+    size: length,
     url: `/file/${sessionId}/${fileId}`,
   };
   // Shows the file in the chat and forwards it to Slack after we have answered

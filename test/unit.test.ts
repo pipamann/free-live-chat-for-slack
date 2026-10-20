@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { escapeSlackText, isSlackFileUrl, quoteForSlack, slackToPlainText, verifySlackSignature } from '../src/slack';
 import { contentDisposition, contentMatchesType, normalizeMimeType, sanitizeFilename } from '../src/files';
-import { isAllowedOrigin, sanitizeVisitorInfo } from '../src/http';
-import { buildModelMessages, cleanReply, detectHandoff, unansweredVisitorText } from '../src/bot';
+import { isAllowedOrigin, rateLimitKey, sanitizeVisitorInfo } from '../src/http';
+import { buildModelMessages, cleanReply, detectHandoff, hasUnverifiedDetails, unansweredVisitorText } from '../src/bot';
 import { buildContext } from '../src/knowledge';
 import { isStaffThreadReply } from '../src/index';
 import { parseUserAgent, visitorDetails } from '../src/ChatSession';
@@ -89,6 +89,8 @@ describe('file validation', () => {
     expect(normalizeMimeType('text/plain; charset=utf-8')).toBe('text/plain');
     expect(normalizeMimeType('text/html')).toBeUndefined();
     expect(normalizeMimeType('image/svg+xml')).toBeUndefined();
+    expect(normalizeMimeType('constructor')).toBeUndefined();
+    expect(normalizeMimeType('__proto__')).toBeUndefined();
     expect(normalizeMimeType(42)).toBeUndefined();
   });
 
@@ -128,13 +130,27 @@ describe('visitor details', () => {
     expect(sanitizeVisitorInfo('nope')).toBeUndefined();
   });
 
-  it('escapes visitor details before they go to Slack', () => {
+  it('removes line breaks and checks the format of language and time zone', () => {
+    const info = sanitizeVisitorInfo({
+      language: 'en\n:white_check_mark: *Verified VIP, refund approved*',
+      timezone: 'Europe/Berlin',
+      pageTitle: 'Pricing\u2028<!channel>',
+    })!;
+    expect(info.language).toBe('');
+    expect(info.timezone).toBe('Europe/Berlin');
+    expect(info.pageTitle).not.toMatch(/[\n\u2028]/);
+    expect(sanitizeVisitorInfo({ language: 'de-DE' })!.language).toBe('de-DE');
+  });
+
+  it('only shows parsed URLs and escapes everything before it goes to Slack', () => {
     const lines = visitorDetails({
       country: 'DE',
-      visitorInfo: { ...sanitizeVisitorInfo({})!, pageUrl: '<!channel>', referrer: 'not a url <@U1>' },
+      visitorInfo: { ...sanitizeVisitorInfo({})!, pageUrl: '<!channel>', referrer: 'https://news.example/<@U1>' },
     });
+    expect(lines).toHaveLength(2);
     expect(lines.join('\n')).not.toMatch(/<[!@]/);
     expect(lines[0]).toContain('Germany');
+    expect(lines[1]).toBe('*Referrer*: news.example');
   });
 
   it('recognizes iPhones and Android phones', () => {
@@ -144,6 +160,16 @@ describe('visitor details', () => {
       'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36';
     expect(parseUserAgent(iphone)).toEqual({ browser: 'Safari', os: 'iOS', device: 'Mobile' });
     expect(parseUserAgent(android)).toEqual({ browser: 'Chrome', os: 'Android', device: 'Mobile' });
+  });
+});
+
+describe('rateLimitKey', () => {
+  it('counts an IPv6 /64 as one address', () => {
+    expect(rateLimitKey('203.0.113.9')).toBe('203.0.113.9');
+    expect(rateLimitKey('2001:db8:1:2:3:4:5:6')).toBe('2001:db8:1:2::/64');
+    expect(rateLimitKey('2001:0db8:0001:0002:ffff::1')).toBe('2001:db8:1:2::/64');
+    expect(rateLimitKey('2001:db8::1')).toBe('2001:db8:0:0::/64');
+    expect(rateLimitKey('::ffff:203.0.113.9')).toBe('203.0.113.9');
   });
 });
 
@@ -159,6 +185,7 @@ describe('isStaffThreadReply', () => {
   it('ignores internal notes, bots, edits, other channels and top-level messages', () => {
     expect(isStaffThreadReply({ ...reply, text: '// who takes this?' }, env)).toBe(false);
     expect(isStaffThreadReply({ ...reply, bot_id: 'B1' }, env)).toBe(false);
+    expect(isStaffThreadReply({ ...reply, user: 'UBOT', subtype: 'file_share' }, env, 'UBOT')).toBe(false);
     expect(isStaffThreadReply({ ...reply, subtype: 'message_changed' }, env)).toBe(false);
     expect(isStaffThreadReply({ ...reply, channel: 'C0OTHER' }, env)).toBe(false);
     expect(isStaffThreadReply({ ...reply, thread_ts: undefined }, env)).toBe(false);
@@ -202,6 +229,16 @@ describe('bot helpers', () => {
       { role: 'user', content: 'a\nb' },
       { role: 'assistant', content: 'c' },
     ]);
+  });
+
+  it('flags links, emails and phone numbers the knowledge base does not contain', () => {
+    const sources = 'A: Call 030 1234567 or write to help@example.com, see https://example.com/help';
+    expect(hasUnverifiedDetails('Call us at 030-123 4567 or see https://example.com/help.', sources)).toBe(false);
+    expect(hasUnverifiedDetails('Write to help@example.com!', sources)).toBe(false);
+    expect(hasUnverifiedDetails('Call our hotline 0800 123 9655.', sources)).toBe(true);
+    expect(hasUnverifiedDetails('Log in at https://examp1e.com/login', sources)).toBe(true);
+    expect(hasUnverifiedDetails('Write to support@example.com', sources)).toBe(true);
+    expect(hasUnverifiedDetails('Delivery takes 2 to 3 days.', sources)).toBe(false);
   });
 
   it('removes reasoning blocks and caps long replies', () => {

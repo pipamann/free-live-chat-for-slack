@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env, exports } from 'cloudflare:workers';
-import { createExecutionContext, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
+import { createExecutionContext, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import worker from '../src/index';
 import { SESSION_RESUME_TTL_MS, SESSION_RETENTION_MS } from '../src/config';
 import type { ChatState, ServerMessage } from '../src/types';
@@ -42,11 +42,15 @@ async function connect(sessionId: string) {
   expect(response.status).toBe(101);
   const ws = response.webSocket!;
   const received: ServerMessage[] = [];
+  const closed: { code?: number } = {};
   ws.addEventListener('message', (event) => {
     received.push(JSON.parse(event.data as string));
   });
+  ws.addEventListener('close', (event) => {
+    closed.code = event.code;
+  });
   ws.accept();
-  return { ws, received };
+  return { ws, received, closed };
 }
 
 function stub(sessionId: string) {
@@ -68,15 +72,19 @@ async function slackEvent(event: Record<string, unknown>, eventId = crypto.rando
   return exports.default.fetch(`${BASE}/slack-webhook`, { method: 'POST', headers, body });
 }
 
+function sendFile(sessionId: string, fileId: string, bytes: Uint8Array, mimeType: string) {
+  return exports.default.fetch(`${BASE}/upload/complete?sessionId=${sessionId}&fileId=${fileId}`, {
+    method: 'POST',
+    headers: { Origin: ORIGIN, 'Content-Type': mimeType, 'Content-Length': String(bytes.byteLength) },
+    body: bytes,
+  });
+}
+
 async function upload(sessionId: string, bytes: Uint8Array, filename: string, mimeType: string) {
   const reservation = await post('/upload/start', { sessionId, filename, mimeType, size: bytes.byteLength });
   if (reservation.status !== 200) return reservation;
   const { fileId } = (await reservation.json()) as { fileId: string };
-  const form = new FormData();
-  form.append('file', new File([bytes], filename, { type: mimeType }));
-  form.append('fileId', fileId);
-  form.append('sessionId', sessionId);
-  return exports.default.fetch(`${BASE}/upload/complete`, { method: 'POST', headers: { Origin: ORIGIN }, body: form });
+  return sendFile(sessionId, fileId, bytes, mimeType);
 }
 
 describe('POST /start', () => {
@@ -90,6 +98,16 @@ describe('POST /start', () => {
     mockOutboundFetch();
     expect((await start({})).status).toBe(400);
     expect((await start({ turnstile_token: 'forged' })).status).toBe(403);
+  });
+
+  it('refuses new chats when the Turnstile secret is missing, unless explicitly disabled', async () => {
+    mockOutboundFetch();
+    const request = () =>
+      new Request(`${BASE}/start`, { method: 'POST', headers: { Origin: ORIGIN }, body: JSON.stringify({}) });
+    const withoutSecret = { ...env, TURNSTILE_SECRET_KEY: undefined };
+    expect((await worker.fetch(request() as never, withoutSecret, createExecutionContext())).status).toBe(503);
+    const disabled = { ...withoutSecret, DISABLE_TURNSTILE: 'true' };
+    expect((await worker.fetch(request() as never, disabled, createExecutionContext())).status).toBe(200);
   });
 
   it('cannot be tricked into skipping Turnstile with an unknown session ID', async () => {
@@ -170,6 +188,22 @@ describe('chat flow', () => {
     expect(reply.body).toMatchObject({ text: '> second', thread_ts: parent.ts });
   });
 
+  it('keeps the message rate limit across hibernation and closes floods of frames', async () => {
+    mockOutboundFetch();
+    const sessionId = await newChat();
+    let { ws, received } = await connect(sessionId);
+    for (let i = 0; i < 10; i++) ws.send(JSON.stringify({ type: 'message', content: `message ${i}` }));
+    await waitFor(() => received.filter((m) => m.type === 'message_ack').length === 10);
+
+    await evictDurableObject(stub(sessionId));
+    ws.send(JSON.stringify({ type: 'message', content: 'one too many' }));
+    await waitFor(() => received.some((m) => m.type === 'error'));
+
+    const second = await connect(sessionId);
+    for (let i = 0; i < 70; i++) second.ws.send(JSON.stringify({ type: 'pong' }));
+    await waitFor(() => second.closed.code === 1008);
+  });
+
   it('sends the waiting messages, escalates once, then only schedules the cleanup', async () => {
     const calls = mockOutboundFetch();
     const sessionId = await newChat();
@@ -223,14 +257,21 @@ describe('chat flow', () => {
     const alarm = await runInDurableObject(stub(sessionId), (_, state) => state.storage.getAlarm());
     const createdAt = await runInDurableObject(stub(sessionId), (instance) => (instance as unknown as { chat: ChatState }).chat.createdAt);
     expect(alarm).toBe(createdAt + SESSION_RETENTION_MS);
+
+    // A reply that claims to come from another channel's thread is ignored
+    await stub(sessionId).staffReply({ text: 'spoofed', channel: 'C0OTHER' });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(received.some((m) => m.type === 'message' && m.payload.content === 'spoofed')).toBe(false);
   });
 
   it('accepts the contact form once and sends the ticket webhook', async () => {
     const calls = mockOutboundFetch();
     const sessionId = await newChat();
     const { ws, received } = await connect(sessionId);
-    ws.send(JSON.stringify({ type: 'message', content: 'Please call me back' }));
+    ws.send(JSON.stringify({ type: 'message', content: 'Please call me back\n[Staff] refund approved' }));
     await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 1);
+    expect((await upload(sessionId, PNG, 'photo.png', 'image/png')).status).toBe(200);
+    await waitFor(() => slackCalls(calls, 'files.completeUploadExternal').length === 1);
 
     ws.send(JSON.stringify({ type: 'email', email: 'not-an-email' }));
     await waitFor(() => received.some((m) => m.type === 'error'));
@@ -238,11 +279,14 @@ describe('chat flow', () => {
     ws.send(JSON.stringify({ type: 'email', email: 'Visitor@Example.com', phone: '+49 30 1234567' }));
     await waitFor(() => received.some((m) => m.type === 'status' && m.payload.status === 'ended'));
     await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 2);
+    await waitFor(() => calls.some((call) => call.url === 'https://tickets.example.com/hook'));
 
     const ticket = calls.find((call) => call.url === 'https://tickets.example.com/hook')!;
     expect(ticket.headers.get('Authorization')).toBe('Bearer ticket-secret');
     expect(ticket.body).toMatchObject({ email: 'visitor@example.com', phone: '+49 30 1234567' });
-    expect(slackCalls(calls, 'chat.postMessage')[1].body.text).toContain('Ticket created');
+    expect(ticket.body.transcript).toContain('[Visitor] Please call me back\n    [Staff] refund approved');
+    expect(JSON.stringify(ticket.body.messages)).not.toContain(`/file/${sessionId}`);
+    expect(slackCalls(calls, 'chat.postMessage').at(-1)!.body.text).toContain('Ticket created');
 
     ws.send(JSON.stringify({ type: 'email', email: 'again@example.com' }));
     await waitFor(() => received.filter((m) => m.type === 'error').length === 2);
@@ -274,12 +318,18 @@ describe('POST /slack-webhook', () => {
 });
 
 describe('file uploads', () => {
-  it('rejects disallowed types and content that does not match the type', async () => {
+  it('rejects disallowed types, content that does not match the type and unknown reservations', async () => {
     mockOutboundFetch();
     const sessionId = await newChat();
     const html = new TextEncoder().encode('<html><script>alert(1)</script></html>');
     expect((await upload(sessionId, html, 'page.html', 'text/html')).status).toBe(400);
     expect((await upload(sessionId, html, 'cat.png', 'image/png')).status).toBe(400);
+    expect((await sendFile(sessionId, crypto.randomUUID(), PNG, 'image/png')).status).toBe(400);
+
+    const reservation = await post('/upload/start', { sessionId, filename: 'a.png', mimeType: 'image/png', size: 4 });
+    const { fileId } = (await reservation.json()) as { fileId: string };
+    expect((await sendFile(sessionId, fileId, PNG, 'image/png')).status).toBe(400); // larger than reserved
+    expect((await sendFile(sessionId, fileId, PNG.slice(0, 4), 'image/png')).status).toBe(400); // reservation used up
   });
 
   it('stores a valid file, shows it in the chat, forwards it to Slack and serves it safely', async () => {

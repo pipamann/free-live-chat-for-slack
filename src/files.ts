@@ -9,7 +9,8 @@ export function normalizeMimeType(mimeType: unknown): string | undefined {
   if (typeof mimeType !== 'string') return undefined;
   const type = mimeType.split(';')[0].trim().toLowerCase();
   const canonical = type === 'image/jpg' ? 'image/jpeg' : type;
-  return canonical in ALLOWED_FILE_TYPES ? canonical : undefined;
+  // hasOwn, not `in`: "constructor" or "__proto__" must not count as allowed types
+  return Object.hasOwn(ALLOWED_FILE_TYPES, canonical) ? canonical : undefined;
 }
 
 /**

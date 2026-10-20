@@ -85,23 +85,45 @@ export async function readJsonObject(request: Request, maxBytes: number): Promis
   }
 }
 
-/** Keeps only the known visitor fields, as strings and numbers of bounded size. */
+/**
+ * Keeps only the known visitor fields, as single-line strings and numbers of bounded size.
+ * Line breaks are removed because these values end up in a Slack message the bot posts.
+ */
 export function sanitizeVisitorInfo(input: unknown): VisitorInfo | undefined {
   if (!input || typeof input !== 'object') return undefined;
   const raw = input as Record<string, unknown>;
-  const text = (value: unknown, max: number) => (typeof value === 'string' ? value.slice(0, max) : '');
+  const text = (value: unknown, max: number) =>
+    typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ').trim().slice(0, max) : '';
+  const matching = (value: string, pattern: RegExp) => (pattern.test(value) ? value : '');
   const size = (value: unknown) =>
     typeof value === 'number' && Number.isFinite(value) ? Math.min(Math.max(Math.round(value), 0), 100_000) : 0;
   return {
     userAgent: text(raw.userAgent, 512),
-    language: text(raw.language, 35),
+    language: matching(text(raw.language, 35), /^[A-Za-z0-9-]+$/),
     pageUrl: text(raw.pageUrl, 2048),
     pageTitle: text(raw.pageTitle, 300),
     referrer: text(raw.referrer, 2048),
     screenWidth: size(raw.screenWidth),
     screenHeight: size(raw.screenHeight),
-    timezone: text(raw.timezone, 64),
+    timezone: matching(text(raw.timezone, 64), /^[A-Za-z0-9_+\-/]+$/),
   };
+}
+
+/**
+ * Key for per-IP rate limits. An IPv6 user usually controls a whole /64 (2^64 addresses),
+ * so the /64 counts as one address.
+ */
+export function rateLimitKey(ip: string): string {
+  if (!ip.includes(':')) return ip;
+  if (ip.includes('.')) return ip.slice(ip.lastIndexOf(':') + 1); // IPv4-mapped IPv6
+  const [head, tail] = ip.toLowerCase().split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(8 - left.length - right.length, 0)).fill('0'), ...right];
+  return `${groups
+    .slice(0, 4)
+    .map((group) => parseInt(group || '0', 16).toString(16))
+    .join(':')}::/64`;
 }
 
 /** Server-side Turnstile check. https://developers.cloudflare.com/turnstile/get-started/server-side-validation/ */

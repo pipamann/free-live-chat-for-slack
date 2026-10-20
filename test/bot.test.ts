@@ -68,6 +68,26 @@ describe('generateBotResponse', () => {
     expect(runs).toHaveLength(0);
   });
 
+  it('hands over instead of passing on contact details the knowledge base does not contain', async () => {
+    const { env } = fakeEnv({
+      score: 0.8,
+      reply: { choices: [{ message: { content: 'Call our free hotline 0800 123 9655.' } }] },
+    });
+    expect(await generateBotResponse(env, [visitor('How long does shipping take?')])).toMatchObject({
+      needsHandoff: true,
+      handoffReason: 'unverified_details',
+    });
+  });
+
+  it('stops asking the model after the per-chat limit', async () => {
+    const { env, runs } = fakeEnv({ score: 0.9, reply: { response: 'Two days.' } });
+    expect(await generateBotResponse(env, [visitor('Shipping?')], 20)).toMatchObject({
+      needsHandoff: true,
+      handoffReason: 'reply_limit',
+    });
+    expect(runs).toHaveLength(0);
+  });
+
   it('hands over instead of failing when the model errors or returns nothing', async () => {
     expect(await generateBotResponse(fakeEnv({ score: 0.9, fail: true }).env, [visitor('Hello?')])).toMatchObject({
       needsHandoff: true,

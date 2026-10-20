@@ -124,20 +124,20 @@ export function isSlackConfigured(env: Env): boolean {
   return Boolean(env.SLACK_BOT_TOKEN && env.SLACK_CHANNEL_ID);
 }
 
-/** Posts a message to the support channel (or into a thread) and returns its timestamp. */
+/** Posts a message to the support channel (or into a thread). Returns its timestamp and channel ID. */
 export async function postSlackMessage(
   env: Env,
   text: string,
   options: { threadTs?: string } = {}
-): Promise<string> {
-  const result = await callSlack<{ ok: boolean; error?: string; ts: string }>(env, 'chat.postMessage', {
+): Promise<{ ts: string; channel: string }> {
+  const result = await callSlack<{ ok: boolean; error?: string; ts: string; channel: string }>(env, 'chat.postMessage', {
     channel: env.SLACK_CHANNEL_ID,
     text,
     thread_ts: options.threadTs,
     unfurl_links: false,
     unfurl_media: false,
   });
-  return result.ts;
+  return { ts: result.ts, channel: result.channel };
 }
 
 export async function getSlackUserName(env: Env, userId: string): Promise<string | undefined> {

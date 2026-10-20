@@ -20,6 +20,8 @@ export const MAX_MESSAGE_LENGTH = 1000;
 export const MAX_MESSAGES_PER_MINUTE = 10;
 /** Hard cap so a single chat cannot grow without bound (Durable Object values are limited to 2 MB). */
 export const MAX_MESSAGES_PER_SESSION = 300;
+/** WebSocket frames of any kind per chat and minute; above this the connection is closed. */
+export const MAX_FRAMES_PER_MINUTE = 60;
 
 // Automatic replies while the visitor waits for a human (used when the AI bot is off)
 /** "Checking whether someone is available…" */
@@ -59,6 +61,8 @@ export const TEXT_MODEL_OPTIONS = { chat_template_kwargs: { enable_thinking: fal
 export const CONFIDENCE_THRESHOLD = 0.5;
 /** Wait this long for follow-up messages before the bot answers. */
 export const BOT_DEBOUNCE_MS = 2 * SECOND;
+/** After this many answers in one chat the bot hands over, so one chat cannot use up the daily AI allowance. */
+export const BOT_MAX_REPLIES_PER_CHAT = 20;
 export const BOT_MAX_HISTORY_MESSAGES = 10;
 export const BOT_MAX_CONTEXT_CHARS = 4000;
 export const BOT_MAX_REPLY_CHARS = 1200;

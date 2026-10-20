@@ -11,7 +11,11 @@ The assistant answers visitors from your own list of questions and answers until
 5. Otherwise the chat model (`@cf/google/gemma-4-26b-a4b-it`) writes a short answer from those entries, in the visitor's language.
 6. The answer appears in the chat (labelled as the assistant) and in the Slack thread with a 🤖. As soon as a team member replies, the assistant stops for this chat.
 
-If anything fails (model unavailable, daily allowance used up, empty answer) the assistant hands over to your team instead of showing an error.
+The assistant also hands over to your team instead of answering when:
+
+- an answer contains a phone number, email address or link that is not in the matched entries or in `CONTACT_INFO` (write numbers in your entries the way the assistant should repeat them),
+- it has already answered 20 times in this chat (`BOT_MAX_REPLIES_PER_CHAT`), so a single chat cannot use up the daily AI allowance,
+- anything fails: model unavailable, daily allowance used up, empty answer.
 
 ## Setup
 

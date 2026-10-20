@@ -139,7 +139,7 @@ If your site has a Content Security Policy, allow your Worker in `script-src`, `
 | `ALLOWED_ORIGINS` | `wrangler.jsonc` | Exact origins that may embed the chat, comma-separated |
 | `SLACK_BOT_TOKEN` | secret | Bot token (`xoxb-…`) |
 | `SLACK_SIGNING_SECRET` | secret | Required: without it every Slack event is rejected |
-| `TURNSTILE_SECRET_KEY` | secret | Strongly recommended: without it anyone can open chats from a script |
+| `TURNSTILE_SECRET_KEY` | secret | Required for new chats. Without it the Worker refuses them, unless you set `DISABLE_TURNSTILE` to `"true"` in `wrangler.jsonc` (then anyone can open chats from a script) |
 | `TICKET_WEBHOOK_URL` | secret | Optional, receives the contact details (the old name `N8N_WEBHOOK_URL` still works) |
 | `TICKET_WEBHOOK_SECRET` | secret | Optional, sent as a Bearer token to the webhook |
 
@@ -147,7 +147,7 @@ Timings, limits and retention are constants in [`src/config.ts`](src/config.ts).
 
 ## Security and privacy
 
-- New chats need a valid Turnstile token and are rate limited per IP. Only `/start` creates chats; a chat's random ID works like a password for its WebSocket, files and resumption.
+- New chats need a valid Turnstile token and are rate limited per IP (per /64 for IPv6). Only `/start` creates chats; a chat's random ID works like a password for its WebSocket, files and resumption. Within a chat, visitors can send 10 messages a minute and 300 in total.
 - Slack events are accepted only with a valid signature that is at most five minutes old.
 - Visitor text is escaped before it goes to Slack, so it cannot ping `@channel` or disguise links. The widget renders all messages as plain text with clickable `http(s)` links only.
 - Uploads: allowed types only, file content must match the type, the extension is corrected, 10 MB and 10 files per chat. Downloads are served as attachments in a sandbox.
@@ -188,8 +188,9 @@ test/               Vitest tests
 
 ## Upgrading from 1.0
 
-- Run `npm run db:migrate`. It removes the old upload table and the IP addresses 1.0 stored.
-- `SLACK_SIGNING_SECRET` is now required, and `ALLOWED_ORIGINS` must list every origin exactly (origins containing "localhost" are no longer let through automatically).
+- Run `npm run db:migrate`. It removes the old upload table, the IP addresses 1.0 stored and Slack thread links older than 30 days.
+- `SLACK_SIGNING_SECRET` and `TURNSTILE_SECRET_KEY` are now required (or set `DISABLE_TURNSTILE` to `"true"`), and `ALLOWED_ORIGINS` must list every origin exactly (origins containing "localhost" are no longer let through automatically).
+- If you wrote your own widget: `/upload/complete` now takes the file itself as the request body, with `sessionId` and `fileId` in the query string, and the response of `/upload/start` no longer contains `r2Key`.
 - Add the `files:write` scope (without it, visitor files never reached Slack) and `groups:history` for private channels, then reinstall the Slack app.
 - The AI assistant is off until you uncomment the `ai` and `vectorize` blocks in `wrangler.jsonc`, and its knowledge base must be uploaded again (new embedding model).
 - Download links of files sent before the upgrade stop working.

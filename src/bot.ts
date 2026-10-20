@@ -6,6 +6,7 @@
 import type { ChatMessage, Env } from './types';
 import {
   BOT_MAX_HISTORY_MESSAGES,
+  BOT_MAX_REPLIES_PER_CHAT,
   BOT_MAX_REPLY_CHARS,
   CONFIDENCE_THRESHOLD,
   EMBEDDING_MODEL,
@@ -13,7 +14,7 @@ import {
   TEXT_MODEL_OPTIONS,
 } from './config';
 import { buildContext, type KnowledgeMetadata } from './knowledge';
-import { HANDOFF_TOPICS, LOW_CONFIDENCE_RESPONSE, buildSystemPrompt } from './prompts';
+import { HANDOFF_TOPICS, LOW_CONFIDENCE_RESPONSE, buildSystemPrompt, contactLines } from './prompts';
 
 export interface BotResponse {
   content: string;
@@ -85,6 +86,24 @@ export function cleanReply(text: string): string {
   return reply;
 }
 
+/**
+ * True if the reply contains a link, email address or phone number that is neither in the
+ * knowledge base entries nor in CONTACT_INFO. Models like to invent plausible ones.
+ */
+export function hasUnverifiedDetails(reply: string, sources: string): boolean {
+  const known = sources.toLowerCase();
+  const knownDigits = sources.replace(/\D/g, '');
+  const links = reply.match(/https?:\/\/[^\s<>"'()]+/g) ?? [];
+  if (links.some((link) => !known.includes(link.replace(/[.,;:!?]+$/, '').toLowerCase()))) return true;
+  const emails = reply.match(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g) ?? [];
+  if (emails.some((email) => !known.includes(email.toLowerCase()))) return true;
+  const phones = reply.match(/\+?\d[\d ()./-]{5,}\d/g) ?? [];
+  return phones.some((phone) => {
+    const digits = phone.replace(/\D/g, '');
+    return digits.length >= 6 && !knownDigits.includes(digits);
+  });
+}
+
 async function embed(ai: Ai, text: string): Promise<number[]> {
   const result = (await ai.run(EMBEDDING_MODEL, { text: [text] })) as { data?: number[][] };
   const vector = result.data?.[0];
@@ -105,8 +124,11 @@ async function generateText(ai: Ai, messages: ModelMessage[]): Promise<string> {
 }
 
 /** Never throws: on any problem the bot hands the chat over to a human. */
-export async function generateBotResponse(env: Env, messages: ChatMessage[]): Promise<BotResponse> {
+export async function generateBotResponse(env: Env, messages: ChatMessage[], repliesSoFar = 0): Promise<BotResponse> {
   const question = unansweredVisitorText(messages);
+  if (repliesSoFar >= BOT_MAX_REPLIES_PER_CHAT) {
+    return { content: LOW_CONFIDENCE_RESPONSE, confidence: 0, needsHandoff: true, handoffReason: 'reply_limit' };
+  }
 
   const handoff = detectHandoff(question);
   if (handoff) {
@@ -134,6 +156,9 @@ export async function generateBotResponse(env: Env, messages: ChatMessage[]): Pr
     const reply = cleanReply(await generateText(env.AI, buildModelMessages(buildSystemPrompt(context), messages)));
     if (!reply) {
       return { content: LOW_CONFIDENCE_RESPONSE, confidence: topScore, needsHandoff: true, handoffReason: 'empty_reply' };
+    }
+    if (hasUnverifiedDetails(reply, `${context}\n${contactLines().join('\n')}`)) {
+      return { content: LOW_CONFIDENCE_RESPONSE, confidence: topScore, needsHandoff: true, handoffReason: 'unverified_details' };
     }
     return { content: reply, confidence: topScore, needsHandoff: false };
   } catch (error) {
