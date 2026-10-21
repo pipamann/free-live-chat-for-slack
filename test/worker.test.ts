@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env, exports } from 'cloudflare:workers';
 import { createExecutionContext, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import worker from '../src/index';
-import { SESSION_RESUME_TTL_MS, SESSION_RETENTION_MS, STAGE_1_DELAY_MS } from '../src/config';
+import { DELIVERY_RETRY_DELAYS_MS, SESSION_RESUME_TTL_MS, SESSION_RETENTION_MS, STAGE_1_DELAY_MS } from '../src/config';
 import type { ChatState, ServerMessage } from '../src/types';
 import { ORIGIN, mockOutboundFetch, signSlackBody, slackCalls, waitFor } from './helpers';
 
@@ -64,6 +64,21 @@ async function editChat(sessionId: string, edit: (chat: ChatState) => void): Pro
     edit(holder.chat);
     await state.storage.put('chatState', holder.chat);
   });
+}
+
+/** A copy of the chat's current state. */
+function readChat(sessionId: string): Promise<ChatState> {
+  return runInDurableObject(stub(sessionId), (instance) =>
+    structuredClone((instance as unknown as { chat: ChatState }).chat)
+  );
+}
+
+/** Runs the chat's alarm as if the delivery retry were due now. */
+async function runDeliveryRetry(sessionId: string): Promise<void> {
+  await editChat(sessionId, (chat) => {
+    chat.deliveryRetryAt = Date.now() - 1;
+  });
+  expect(await runDurableObjectAlarm(stub(sessionId))).toBe(true);
 }
 
 async function slackEvent(event: Record<string, unknown>, eventId = crypto.randomUUID()) {
@@ -264,6 +279,73 @@ describe('chat flow', () => {
     const second = await connect(sessionId);
     for (let i = 0; i < 70; i++) second.ws.send(JSON.stringify({ type: 'pong' }));
     await waitFor(() => second.closed.code === 1008);
+  });
+
+  it('retries Slack posts and notices with the alarm until Slack accepts them', async () => {
+    let calls = mockOutboundFetch({ slackDown: true });
+    const sessionId = await newChat();
+    const { ws, received } = await connect(sessionId);
+    ws.send(JSON.stringify({ type: 'message', content: 'Hello?' }));
+    await waitFor(async () => (await readChat(sessionId)).deliveryAttempts === 1);
+    ws.send(JSON.stringify({ type: 'email', email: 'me@example.com' }));
+    await waitFor(() => received.some((m) => m.type === 'status' && m.payload.status === 'ended'));
+
+    let chat = await readChat(sessionId);
+    expect(chat.slackOutbox).toHaveLength(1);
+    expect(chat.deliveryRetryAt).toBeGreaterThan(Date.now());
+    expect(slackCalls(calls, 'chat.postMessage').length).toBeGreaterThan(0); // all of them failed
+
+    vi.restoreAllMocks();
+    calls = mockOutboundFetch();
+    await runDeliveryRetry(sessionId);
+    await waitFor(() => slackCalls(calls, 'chat.postMessage').length === 2);
+    const [parent, notice] = slackCalls(calls, 'chat.postMessage');
+    expect(parent.body.text).toContain('> Hello?');
+    expect(notice.body).toMatchObject({ thread_ts: parent.ts });
+    expect(notice.body.text).toContain('me@example.com');
+
+    chat = await readChat(sessionId);
+    expect(chat).toMatchObject({ slackOutbox: [], deliveryAttempts: 0, routingSaved: true });
+    expect(chat.deliveryRetryAt).toBeUndefined();
+  });
+
+  it('stops retrying after the last delay', async () => {
+    mockOutboundFetch({ slackDown: true });
+    const sessionId = await newChat();
+    const { ws } = await connect(sessionId);
+    ws.send(JSON.stringify({ type: 'message', content: 'Hello?' }));
+    await waitFor(async () => (await readChat(sessionId)).deliveryAttempts === 1);
+    expect((await readChat(sessionId)).deliveryRetryAt).toBeDefined();
+
+    await editChat(sessionId, (chat) => {
+      chat.deliveryAttempts = DELIVERY_RETRY_DELAYS_MS.length;
+    });
+    await runDeliveryRetry(sessionId);
+    await waitFor(async () => (await readChat(sessionId)).deliveryAttempts === DELIVERY_RETRY_DELAYS_MS.length + 1);
+    expect((await readChat(sessionId)).deliveryRetryAt).toBeUndefined();
+  });
+
+  it('saves the Slack routing row later when D1 fails at first, without posting the thread twice', async () => {
+    const calls = mockOutboundFetch();
+    const sessionId = await newChat();
+    const { ws } = await connect(sessionId);
+    await env.DB.exec('ALTER TABLE chat_sessions RENAME TO chat_sessions_offline');
+    try {
+      ws.send(JSON.stringify({ type: 'message', content: 'Hello' }));
+      await waitFor(async () => (await readChat(sessionId)).deliveryAttempts === 1, 5000);
+    } finally {
+      await env.DB.exec('ALTER TABLE chat_sessions_offline RENAME TO chat_sessions');
+    }
+    expect((await readChat(sessionId)).routingSaved).toBe(false);
+
+    await runDeliveryRetry(sessionId);
+    await waitFor(async () => (await readChat(sessionId)).routingSaved);
+    const [parent] = slackCalls(calls, 'chat.postMessage');
+    const row = await env.DB.prepare('SELECT session_name FROM chat_sessions WHERE slack_thread_ts = ?')
+      .bind(parent.ts)
+      .first();
+    expect(row).toMatchObject({ session_name: sessionId });
+    expect(slackCalls(calls, 'chat.postMessage')).toHaveLength(1);
   });
 
   it('sends the waiting messages, escalates once, then only schedules the cleanup', async () => {

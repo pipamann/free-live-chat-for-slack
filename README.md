@@ -100,6 +100,7 @@ Open your website, send a message and answer it in the Slack thread. If somethin
 - As soon as someone replies, the automatic messages and the AI assistant stop.
 - If nobody answers within 30 seconds, the visitor gets a contact form. What they enter is posted to the thread and, if `TICKET_WEBHOOK_URL` is set, sent there as JSON: `email`, `phone`, `transcript`, `messages`, `visitor_info`, `country`, `session_id`, `slack_thread_ts`, `submitted_at`. With `TICKET_WEBHOOK_SECRET` the request carries `Authorization: Bearer <secret>`.
 - Visitors can resume a chat for 24 hours (reloads, other pages, coming back later).
+- If Slack or the database is briefly unavailable, nothing is lost: messages and notices are posted again after 1, 5, 15, 60 and 240 minutes, and with the visitor's next message.
 
 ## Widget options
 

@@ -102,6 +102,13 @@ export interface ChatState {
   slackChannel?: string;
   /** How many visitor messages have been posted to Slack (the rest is retried later). */
   slackSyncedCount: number;
+  /** Whether the D1 row that routes Slack replies to this chat has been written. */
+  routingSaved: boolean;
+  /** Notices for the team (contact details, bot replies…) waiting to be posted to the thread. */
+  slackOutbox: string[];
+  /** Failed deliveries to Slack or D1 since the last success, and when the alarm tries again. */
+  deliveryAttempts: number;
+  deliveryRetryAt?: number;
   customerEmail?: string;
   customerPhone?: string;
   botActive: boolean;

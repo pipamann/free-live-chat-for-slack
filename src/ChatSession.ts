@@ -12,6 +12,7 @@ import type {
   VisitorInfo,
 } from './types';
 import {
+  DELIVERY_RETRY_DELAYS_MS,
   MAX_FILE_SIZE,
   MAX_FRAMES_PER_MINUTE,
   MAX_MESSAGE_LENGTH,
@@ -96,6 +97,9 @@ export class ChatSession extends DurableObject<Env> {
       pendingUploads: {},
       files: {},
       slackSyncedCount: 0,
+      routingSaved: false,
+      slackOutbox: [],
+      deliveryAttempts: 0,
     };
     await this.save();
     await this.scheduleAlarm();
@@ -275,6 +279,9 @@ export class ChatSession extends DurableObject<Env> {
       await this.purge();
       return;
     }
+    if (chat.deliveryRetryAt !== undefined && now >= chat.deliveryRetryAt) {
+      chat.deliveryRetryAt = undefined; // deliver() sets the next one if this attempt fails too
+    }
 
     // Decided before any network call: a staff reply arriving during one must not be overwritten.
     // (Storage writes do not let other events in, Slack and D1 calls do.)
@@ -294,20 +301,21 @@ export class ChatSession extends DurableObject<Env> {
     }
     await this.scheduleAlarm();
 
-    // Network calls last; they also retry visitor messages that could not be posted earlier
+    // Network calls last; they also retry whatever could not be delivered earlier
     if (escalated) {
       await this.updateRoutingRow({ status: 'escalated' });
       await this.postNotice(SLACK_TEXTS.stageNotice(escapeSlackText(VISITOR_TEXTS.stage2)));
-    } else if (chat.slackSyncedCount < chat.messages.filter((m) => m.role === 'customer').length) {
-      await this.enqueueSlack(() => this.syncVisitorMessages());
+    } else if (this.hasPendingDelivery()) {
+      await this.deliver();
     }
   }
 
-  /** Runs whichever comes first: the next automatic reply or the deletion of the chat. */
+  /** Runs whichever comes first: the next automatic reply, a delivery retry or the deletion of the chat. */
   private async scheduleAlarm(): Promise<void> {
     const chat = this.chat;
     if (!chat) return;
     const times = [deletionTime(chat)];
+    if (chat.deliveryRetryAt !== undefined) times.push(chat.deliveryRetryAt);
     if (this.waitingForStaff() && chat.firstCustomerMessageAt) {
       if (!chat.stage1Sent) times.push(chat.firstCustomerMessageAt + STAGE_1_DELAY_MS);
       else if (!chat.stage2Sent) times.push(chat.firstCustomerMessageAt + STAGE_2_DELAY_MS);
@@ -387,7 +395,7 @@ export class ChatSession extends DurableObject<Env> {
     // Later messages do not push the automatic replies back, or the visitor would never be offered the contact form
     if (isFirst) await this.scheduleAlarm();
 
-    await this.enqueueSlack(() => this.syncVisitorMessages());
+    await this.deliver();
   }
 
   /** Rate limit and size cap for everything a visitor sends. The times are saved with the next change. */
@@ -625,27 +633,90 @@ export class ChatSession extends DurableObject<Env> {
     const { ts, channel } = await postSlackMessage(this.env, text);
     chat.slackThreadTs = ts;
     chat.slackChannel = channel;
+    chat.routingSaved = false; // written by deliver() right after this
     await this.save();
+  }
 
-    // Lets /slack-webhook find this chat when someone replies in the thread
-    try {
-      await this.env.DB.prepare(
-        'INSERT OR REPLACE INTO chat_sessions (id, slack_thread_ts, status, customer_email, session_name) VALUES (?, ?, ?, ?, ?)'
-      )
-        .bind(chat.sessionId, chat.slackThreadTs, chat.status, chat.customerEmail ?? null, chat.sessionName)
-        .run();
-    } catch (error) {
-      console.error('[ChatSession] D1 insert failed, staff replies cannot be routed:', error);
+  /**
+   * Writes the D1 row that lets /slack-webhook find this chat when someone replies in the
+   * thread. Three quick attempts; if all fail, deliver() schedules a retry with the alarm.
+   */
+  private async saveRouting(): Promise<void> {
+    const chat = this.chat!;
+    if (!chat.slackThreadTs || chat.routingSaved) return;
+    const statement = this.env.DB.prepare(
+      'INSERT OR REPLACE INTO chat_sessions (id, slack_thread_ts, status, customer_email, session_name) VALUES (?, ?, ?, ?, ?)'
+    ).bind(chat.sessionId, chat.slackThreadTs, chat.status, chat.customerEmail ?? null, chat.sessionName);
+    for (const pause of [0, 300, 1500]) {
+      if (pause) await new Promise((resolve) => setTimeout(resolve, pause));
+      try {
+        await statement.run();
+        chat.routingSaved = true;
+        await this.save();
+        return;
+      } catch (error) {
+        console.error('[ChatSession] Saving the Slack routing row failed:', error);
+      }
+    }
+    throw new Error('The Slack routing row could not be saved');
+  }
+
+  /** A notice for the team (bot reply, contact details…). It stays in the outbox until Slack accepts it. */
+  private async postNotice(text: string): Promise<void> {
+    const chat = this.chat;
+    if (!chat || !isSlackConfigured(this.env)) return;
+    chat.slackOutbox.push(text);
+    await this.save();
+    await this.deliver();
+  }
+
+  /** Posts waiting notices in order; each one leaves the outbox only once Slack has accepted it. */
+  private async flushNotices(): Promise<void> {
+    const chat = this.chat!;
+    while (chat.slackThreadTs && chat.slackOutbox.length > 0) {
+      await postSlackMessage(this.env, chat.slackOutbox[0], { threadTs: chat.slackThreadTs });
+      chat.slackOutbox.shift();
+      await this.save();
     }
   }
 
-  /** A notice for the team (bot reply, contact details…), posted in the chat's thread. */
-  private async postNotice(text: string): Promise<void> {
-    await this.enqueueSlack(async () => {
-      await this.syncVisitorMessages();
-      const threadTs = this.chat?.slackThreadTs;
-      if (threadTs) await postSlackMessage(this.env, text, { threadTs });
+  /**
+   * Brings Slack up to date: visitor messages (the first opens the thread), the D1 routing row,
+   * then waiting notices. If anything fails, the alarm tries again after each of
+   * DELIVERY_RETRY_DELAYS_MS and then stops; the visitor's next message tries again too.
+   */
+  private deliver(): Promise<void> {
+    return this.enqueueSlack(async () => {
+      const chat = this.chat;
+      if (!chat || !isSlackConfigured(this.env)) return;
+      try {
+        await this.syncVisitorMessages();
+        await this.saveRouting();
+        await this.flushNotices();
+        if (chat.deliveryAttempts === 0 && chat.deliveryRetryAt === undefined) return;
+        chat.deliveryAttempts = 0;
+        chat.deliveryRetryAt = undefined;
+      } catch (error) {
+        console.error('[ChatSession] Delivering to Slack failed:', error);
+        const delay = DELIVERY_RETRY_DELAYS_MS[chat.deliveryAttempts];
+        chat.deliveryAttempts++;
+        chat.deliveryRetryAt = delay === undefined ? undefined : Date.now() + delay;
+      }
+      if (this.chat !== chat) return; // deleted meanwhile
+      await this.save();
+      await this.scheduleAlarm();
     });
+  }
+
+  private hasPendingDelivery(): boolean {
+    const chat = this.chat;
+    if (!chat || !isSlackConfigured(this.env)) return false;
+    const visitorMessages = chat.messages.filter((m) => m.role === 'customer').length;
+    return (
+      chat.slackSyncedCount < visitorMessages ||
+      chat.slackOutbox.length > 0 ||
+      (!!chat.slackThreadTs && !chat.routingSaved)
+    );
   }
 
   private async uploadVisitorFileToSlack(attachment: FileAttachment): Promise<void> {
@@ -768,6 +839,9 @@ function withDefaults(stored: ChatState & { ipAddress?: string }): ChatState {
     pendingUploads: state.pendingUploads ?? {},
     files: state.files ?? {},
     slackSyncedCount: state.slackSyncedCount ?? (state.slackThreadTs ? visitorMessageCount : 0),
+    routingSaved: state.routingSaved ?? Boolean(state.slackThreadTs),
+    slackOutbox: state.slackOutbox ?? [],
+    deliveryAttempts: state.deliveryAttempts ?? 0,
     botReplies: state.botReplies ?? 0,
     recentMessageTimes: state.recentMessageTimes ?? [],
   };

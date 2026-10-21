@@ -23,6 +23,12 @@ export const MAX_MESSAGES_PER_SESSION = 300;
 /** WebSocket frames of any kind per chat and minute; above this the connection is closed. */
 export const MAX_FRAMES_PER_MINUTE = 60;
 
+/**
+ * When the alarm retries Slack posts and the D1 routing row after a failure. After the last
+ * delay it stops; the visitor's next message tries again.
+ */
+export const DELIVERY_RETRY_DELAYS_MS = [1, 5, 15, 60, 240].map((minutes) => minutes * MINUTE);
+
 // Automatic replies while the visitor waits for a human (used when the AI bot is off)
 /** "Checking whether someone is available…" */
 export const STAGE_1_DELAY_MS = 8 * SECOND;
