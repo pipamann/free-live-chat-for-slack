@@ -602,6 +602,7 @@ export class ChatSession extends DurableObject<Env> {
     const visitorMessages = chat.messages.filter((m) => m.role === 'customer');
 
     for (const message of visitorMessages.slice(chat.slackSyncedCount)) {
+      if (this.chat !== chat) return; // deleted meanwhile
       const text = message.content
         ? quoteForSlack(message.content)
         : (message.attachments ?? []).map((a) => quoteForSlack(SLACK_TEXTS.fileMessage(a.name))).join('\n');
@@ -642,21 +643,29 @@ export class ChatSession extends DurableObject<Env> {
    * thread. Three quick attempts; if all fail, deliver() schedules a retry with the alarm.
    */
   private async saveRouting(): Promise<void> {
-    const chat = this.chat!;
-    if (!chat.slackThreadTs || chat.routingSaved) return;
+    const chat = this.chat;
+    if (!chat?.slackThreadTs || chat.routingSaved) return;
     const statement = this.env.DB.prepare(
       'INSERT OR REPLACE INTO chat_sessions (id, slack_thread_ts, status, customer_email, session_name) VALUES (?, ?, ?, ?, ?)'
     ).bind(chat.sessionId, chat.slackThreadTs, chat.status, chat.customerEmail ?? null, chat.sessionName);
     for (const pause of [0, 300, 1500]) {
       if (pause) await new Promise((resolve) => setTimeout(resolve, pause));
+      // A chat deleted meanwhile must not get its row (with the email address) back
+      if (this.chat !== chat) return;
       try {
         await statement.run();
-        chat.routingSaved = true;
-        await this.save();
-        return;
       } catch (error) {
         console.error('[ChatSession] Saving the Slack routing row failed:', error);
+        continue;
       }
+      if (this.chat !== chat) {
+        // Deleted while the insert was on its way
+        await this.env.DB.prepare('DELETE FROM chat_sessions WHERE id = ?').bind(chat.sessionId).run();
+        return;
+      }
+      chat.routingSaved = true;
+      await this.save();
+      return;
     }
     throw new Error('The Slack routing row could not be saved');
   }
@@ -672,8 +681,8 @@ export class ChatSession extends DurableObject<Env> {
 
   /** Posts waiting notices in order; each one leaves the outbox only once Slack has accepted it. */
   private async flushNotices(): Promise<void> {
-    const chat = this.chat!;
-    while (chat.slackThreadTs && chat.slackOutbox.length > 0) {
+    const chat = this.chat;
+    while (chat && this.chat === chat && chat.slackThreadTs && chat.slackOutbox.length > 0) {
       await postSlackMessage(this.env, chat.slackOutbox[0], { threadTs: chat.slackThreadTs });
       chat.slackOutbox.shift();
       await this.save();
